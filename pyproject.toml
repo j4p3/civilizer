@@ -1,0 +1,25 @@
+[project]
+name = "civilizer"
+version = "0.1.0"
+description = "Civ VII game-state extraction for coaching (live UI debugger, saves, logs)"
+readme = "README.md"
+authors = [
+    { name = "JP", email = "jpbonner@propertypilot.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "mcp>=2.3.0",
+    "websockets>=17.4",
+]
+
+[project.scripts]
+civilizer = "civilizer:main"
+
+[build-system]
+requires = ["uv_build>=0.9.11,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
