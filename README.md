@@ -8,7 +8,8 @@ Extracts Sid Meier's Civilization VII game state for an AI coach. It reads three
 | **Save files** (`.Civ7Save`) | Metadata (turn, age, difficulty, map, mods, version), player roster, per-player gold and influence, save timeline with reload-branch detection | Uncompressed typed-chunk header and a zlib block stream holding the game database |
 | **Logs** (`My Games/.../Logs/*.csv`) | Turn-by-turn stats (yields, treasury, happiness, settlements), trade route events, purchases, build queues, combat, diplomacy events | CSV parsing. The game wipes logs on every launch, so `archive-logs` copies them to `data/archive/` |
 
-Plus `rules`, a lookup over the game's installed text and data XML.
+Plus `rules`, a lookup over the game's installed text and data XML, and `pedia`, an indexed Civilopedia
+(see [Civilopedia index](#civilopedia-index)).
 
 ## Getting started
 
@@ -28,12 +29,15 @@ Each play session, new game or loaded save:
 
 1. Launch Civ VII.
 2. Run `civilizer up`. It serves the dashboard at http://127.0.0.1:8777, opens it, and starts the monitor.
+   The dashboard opens on a Games screen that lists every recorded game and repeats these steps.
    The monitor waits at the main menu and records a turn each time you end one. If a monitor or dashboard
    is already running, `up` reuses it.
 3. Start or load the game.
 4. Open Claude Code in this repo (`cd ~/src/civilizer && claude`) and approve the `civilizer` MCP server
-   from `.mcp.json` the first time. Then just talk to the advisor: pick its personality, say how you like to
-   play and what you're going for. It records your profile, strategy and goals, then briefs you each turn.
+   from `.mcp.json` the first time. Then ask the advisor to set up the game. A short wizard asks you to pick
+   an advisor (a preset, a saved one, or a custom voice you describe), what you're here for (fight, build,
+   explore, mess around, make a story) plus a follow-up or two, and a strategy ("just win" and "not sure" are
+   options). Advisor and player profiles are saved and offered again in later games.
    Outside this repo the MCP tools aren't loaded; the skill falls back to the `civilizer` CLI.
 
 A new game appears in the store and dashboard after its first recorded turn. Until the game's first
@@ -42,6 +46,11 @@ Log sessions and saves are matched to the game by snapshot times, so an older ga
 
 Run the pieces separately with `civilizer monitor` and `civilizer dashboard`. To rebuild the store from
 what's archived without the game running, use `civilizer refresh`.
+
+The dashboard uses the [Foolscap](https://github.com/j4p3/foolscap) design system: its tokens, components,
+fonts and Observable Plot chart helper are vendored under `src/civilizer/web/foolscap/` so the page works
+offline. After changing Foolscap (expected at `~/src/foolscap`), refresh the copies with
+`scripts/vendor-foolscap.sh`. Edit Foolscap itself, not the vendored files.
 
 ## Usage
 
@@ -93,18 +102,62 @@ uv run civilizer refresh            # rebuild the store's game facts from what i
 uv run civilizer dashboard          # http://127.0.0.1:8777
 uv run civilizer mcp                # MCP stdio server (registered in .mcp.json)
 uv run civilizer advisor brief      # the advisor's per-turn briefing; also profile/strategy/goal/annotate
-uv run civilizer pedia "Tariffs"    # Civilopedia search
+uv run civilizer advisor setup      # setup wizard step as JSON (advisor, player, strategy); also profiles/use/preset
+uv run civilizer pedia "Tariffs"    # Civilopedia full-text reader (long chapter text)
+uv run civilizer pedia search cothon # indexed Civilopedia: search / page / links / compare / filter / reachable
 uv run civilizer schema             # store documentation
 ```
 
 - **Game facts** (exporter-owned, rebuilt every turn): `games`, `ages`, `players`, `turns`, `metrics`
   (long format, with `visibility` = visible | omniscient), `events` (the timeline, with stable
-  `event_key`s), `phases` (fact sheets and heuristic verdicts per age, war and goal; no prose).
-- **Advisor tables** (never touched by refresh): versioned `advisor_profiles` (the personality Claude
-  plays: jocular, terse_military, sarcastic, ...) and `player_profiles` (playstyle: aggressive,
-  efficient, whimsical, ...), `strategies` (victory types or expansion), `goals` (long-term goals with
+  `event_key`s), `phases` (fact sheets and heuristic outcomes per age, war and goal; no prose).
+- **Advisor tables** (never touched by refresh): reusable, versioned `advisor_profiles` (the
+  personality Claude plays: a preset from `src/civilizer/advisors/*.md` or a custom one in
+  `data/advisors/*.md`, each a style prompt Claude follows) and `player_profiles` (motives and playstyle),
+  linked to each game through `game_profiles`; `strategies` (victory types or expansion), `goals` (long-term goals with
   short-term children) linked to metrics through `goal_metrics`, and `annotations`: the player's
-  intentions, priority changes, and Claude's narrative and verdicts on how each phase went.
+  intentions, priority changes, and Claude's narrative and outcomes (success, partial, failure,
+  changed_plans, ongoing) of how each phase went.
+
+## Civilopedia index
+
+`data/civilopedia.db` (SQLite, built from the install on first use; read-only on the game files) holds the
+in-game Civilopedia as connected pages: the prose pages (concepts, ages, history chapters) plus one page per
+gameplay item with facts from the data XML and explicit edges. Source: `src/civilizer/civilopedia.py`.
+
+```bash
+uv run civilizer pedia build [--force]               # build; skipped when the version key is unchanged
+uv run civilizer pedia search "gold building" -k building -a antiquity
+uv run civilizer pedia page Cothon                     # text + facts + links (key or title)
+uv run civilizer pedia links "Code of Laws" -r unlocks # also unlocked_by, prereq(_of), unique_to/has_unique, mentions ...
+uv run civilizer pedia compare Cothon Dockyard Market  # facts side by side
+uv run civilizer pedia filter -k building -a antiquity -c carthage
+uv run civilizer pedia reachable Pottery Chiefdom -s 2 -c carthage   # next techs/civics and what they unlock
+uv run civilizer pedia info                            # version, counts
+```
+
+The same functions are MCP tools (`pedia_search`, `pedia_page`, `pedia_links`, `pedia_compare`, `pedia_filter`,
+`pedia_reachable`), returning compact JSON.
+
+- **Tables**: `pages` (key = gameplay type such as `BUILDING_COTHON` / `NODE_CIVIC_AQ_MAIN_CODE_OF_LAWS`, or
+  `CONCEPTS:BIOME_4`, `TERM:SETTLEMENT_LIMIT`; kind, title, section, ages, module, dlc, listed, summary, text,
+  chapters JSON, facts JSON), `pages_fts` (FTS5: title, aliases, summary, body, facts), `aliases` (title and key
+  lookups), `edges` (src, dst, rel, anchor, detail), `meta` (version key, Steam build id, counts).
+- **Facts**: cost, base yields, maintenance, adjacencies, building category (the game's TypeTags: Cothon
+  `production`, Dockyard `gold`), placement (terrain, biome, district, river...), unlocked_by, unique_to, quarter,
+  unit stats / upgrades / replaces, tech/civic prereqs and unlocks with modifier text ("+1 Settlement Limit."),
+  civ and leader abilities, unique items and next-age civ unlocks, resource yields and where they spawn.
+- **Edges**: `mentions` from the game's own `[TIP:LOC_PEDIA_CONCEPTS_<TERM>_TOOLTIP]anchor[/TIP]` markup (the only
+  in-text link syntax; each tooltip becomes a `term` page), `[icon:<TYPE>]` tokens and, in concept prose, page
+  titles (detail `via: name`); data edges `unlocks`, `prereq`, `unique_to`, `replaces`, `upgrades_to`,
+  `belongs_to_quarter`, `requires_building`, `placed_on`, `improves_resource`, `found_in`, `unlocks_civ`,
+  `obsoletes`, `see_also`. Each is queryable backwards under its inverse name (`unlocked_by`, `has_unique`, ...).
+- **Version key**: Steam build id, extractor source and path/mtime/size of every data, config and text file;
+  queries rebuild a stale index (checked every 10 minutes).
+- **Limits**: all modules are merged (the game builds one database per age and owned DLC), so `<Update>`/`<Delete>`
+  rows are not applied and an item's age comes from its Age column, its age module, its civ or its unlocking
+  node. Unit abilities, promotions and great-person details beyond the action text are not extracted.
+  `civilizer rules` stays the tool for raw modifier XML.
 
 ## Game export
 
@@ -128,7 +181,8 @@ uv run civilizer schema             # store documentation
   - `start` and `end` are `{age, turn, g}`. When the turn is only bracketed, they also carry `lo` and `hi`.
   - Kinds: `age`, `war`, `war_declared`, `alliance`, `settlement`, `settlement_captured`, `tech`, `civic`,
     `tech_research`, `civic_research`, `government`, `religion`, `religion_founded`, `unit_killed`, `project`,
-    `production`, `purchase`, `legacy`.
+    `production`, `purchase`, `legacy`, and diplomacy (`diplomacy.py`): `diplomacy_action`, `befriend`,
+    `suzerain`, `diplo_response`, `met`.
   - `precision` is one of:
     - `exact`: from a log or a per-turn snapshot.
     - `range`: happened between two captures.
@@ -138,7 +192,7 @@ uv run civilizer schema             # store documentation
 
 Sources and their reach:
 
-- **Logs**: wars, captures, religion, kills and production, for every player. They only cover
+- **Logs**: wars, captures, religion, kills, production and diplomacy (DiplomacySummary, Game_Gossip), for every player. They only cover
   archived sessions. One session can run into the next age, which is detected from turn resets.
 - **Snapshots**: the local player's exact research, civic and government turns.
 - **Captures**: every player's researched nodes, government, religion, settlements and wars at

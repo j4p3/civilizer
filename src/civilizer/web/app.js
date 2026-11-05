@@ -1,6 +1,8 @@
-// Civilizer dashboard: vanilla JS, inline SVG, no dependencies. Reads the JSON API in dashboard.py and
-// polls /api/version every 10 s; when the token changes (the monitor appended a turn, or the advisor wrote
-// a note) the current view refetches while holding its previous render at reduced opacity.
+// Civilizer dashboard: vanilla JS on the Foolscap design system. Figures are Observable Plot specs rendered
+// through Foolscap's fcChart (foolscap/foolscap-plot.js), which themes them from the --fc-* tokens and
+// re-renders them on resize and on the paper/blueprint switch. Reads the JSON API in dashboard.py and polls
+// /api/version every 10 s; when the token changes (the monitor appended a turn, or the advisor wrote a note)
+// the current view refetches while holding its previous render at reduced opacity.
 "use strict";
 
 // ------------------------------------------------------------------ dom helpers
@@ -28,23 +30,23 @@ function setAttrs(el, attrs, isSvg) {
 const h = (tag, attrs, ...kids) => add(setAttrs(document.createElement(tag), attrs, false), kids);
 const s = (tag, attrs, ...kids) => add(setAttrs(document.createElementNS(SVGNS, tag), attrs, true), kids);
 
-let _ctx;
-function textW(str, px = 11, weight = 400) {
-  _ctx = _ctx || document.createElement("canvas").getContext("2d");
-  _ctx.font = `${weight} ${px}px system-ui, -apple-system, "Segoe UI", sans-serif`;
-  return _ctx.measureText(str).width;
-}
+// Rough width of mono caption text, for deciding whether a label fits inside a bar.
+const textW = (str, px = 11) => String(str).length * px * 0.6;
 
 // ------------------------------------------------------------------ state
 const S = {
-  tab: "overview", token: null, meta: null, players: {}, local: 0,
+  tab: "home", game: new URLSearchParams(location.search).get("game"), token: null, meta: null, players: {}, local: 0,
   chart: { metric: "gold_per_turn", vis: "visible", hidden: new Set(), range: "all", table: false },
   tl: { local: true, domain: null, off: new Set() },
   turn: { g: null, localOnly: true },
   notes: { kind: "" },
 };
 
+// Every game endpoint takes ?game=<seed>; without it the server picks the most recently refreshed game.
+const withGame = path => S.game && path !== "/api/games" ? path + (path.includes("?") ? "&" : "?") + "game=" + encodeURIComponent(S.game) : path;
+const gameHref = (game, tab = "overview") => `/?game=${encodeURIComponent(game)}#${tab}`;
 async function api(path) {
+  path = withGame(path);
   const r = await fetch(path, { cache: "no-store" });
   let body;
   try { body = await r.json(); } catch (e) { throw new Error(`${path}: HTTP ${r.status}`); }
@@ -90,7 +92,8 @@ function gLabel(g, withG) {
 }
 const gRange = (a, b) => b == null || a === b ? gLabel(a) : (ageAt(a) === ageAt(b) ? `${gLabel(a)}–T${b - ageAt(b).g_offset}` : `${gLabel(a)} – ${gLabel(b)}`);
 
-const isMajor = id => id != null && id >= 0 && id < 8 && S.players[id] != null;
+const MAJORS = 12;  // one chart colour per major player id 0..11 (--fc-color-chart-1..12)
+const isMajor = id => id != null && id >= 0 && id < MAJORS && S.players[id] != null;
 const pcolor = id => isMajor(id) ? `var(--p${id})` : "var(--minor)";
 function pname(id, short) {
   if (id == null) return "—";
@@ -104,19 +107,42 @@ function pciv(id) {
   const c = p.civilizations || {};
   return c[S.meta?.game?.current_age] || Object.values(c).pop() || "";
 }
+// Plot needs resolved colours rather than var() references: take them from fcTokens().
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const pcolorT = (id, t) => isMajor(id) ? t.series[id] : cssVar("--fc-color-text-faint");
 const swatch = id => h("span", { class: "sw", style: `background:${pcolor(id)}` });
 const lineKey = color => h("span", { class: "lk", style: `background:${color}` });
 
-const VERDICT = {
-  went_well: ["✓", "Went well"], went_awry: ["✕", "Went awry"], mixed: ["◐", "Mixed"],
-  ongoing: ["…", "Ongoing"], neutral: ["–", "Neutral"],
+const OUTCOME = {
+  success: ["✓", "Success"], partial: ["◐", "Partial"], failure: ["✕", "Failure"],
+  changed_plans: ["↷", "Changed plans"], ongoing: ["…", "Ongoing"],
 };
 function badge(v, source) {
   if (!v) return null;
-  const [ic, label] = VERDICT[v] || ["?", v];
-  return h("span", { class: `badge v-${v}`, title: source ? `Verdict source: ${source}` : null },
+  const [ic, label] = OUTCOME[v] || ["?", v];
+  return h("span", { class: `badge v-${v}`, title: source ? `Outcome source: ${source}` : null },
     h("span", { class: "ic" }, ic), label, source ? h("span", { class: "src" }, source === "advisor" ? "· advisor" : "· heuristic") : null);
 }
+// Game outcome (dashboard._outcome): "over" once any player has won a victory, else in progress. "unknown" means no
+// snapshot has captured victories yet; nobody is known to have won, so it reads as in progress.
+const victoryName = v => ({ VICTORY_SCORE: "Score", VICTORY_DOMINATION: "Domination" })[v]
+  || pretty(String(v || "").replace(/^VICTORY_|_MODERN$|^MODERN_/g, "")) + " victory";
+function outcomeText(o) {
+  if (o?.status !== "over") return o?.status === "in_progress" ? "In progress" : "In progress · no victory recorded yet";
+  const wins = o.victories.map(v => `${v.players.map(p => p.leader || `player ${p.id}`).join(" & ") || "Unknown"} won the ${victoryName(v.victory)}`);
+  return `Game over · ${wins.join("; ")}`;
+}
+const ICON = {  // 16px stroke icons in the ink of their context: a pennant for a finished game, an hourglass for one in play
+  over: "M4 15V1.5M4 2h8.5l-2.2 3 2.2 3H4",
+  in_progress: "M4 1.5h8M4 14.5h8M5 1.5c0 4 6 3.5 6 6.5s-6 2.5-6 6.5M11 1.5c0 4-6 3.5-6 6.5s6 2.5 6 6.5",
+};
+function statusIcon(o) {
+  const over = o?.status === "over", text = outcomeText(o);
+  return h("span", { class: `status-ic ${over ? "over" : "live"}`, title: text, role: "img", "aria-label": text },
+    s("svg", { viewBox: "0 0 16 16", width: 16, height: 16, "aria-hidden": "true" },
+      s("path", { d: ICON[over ? "over" : "in_progress"], fill: "none", stroke: "currentColor", "stroke-width": 1.5, "stroke-linejoin": "round", "stroke-linecap": "round" })));
+}
+
 function deltaSpan(d, hib, unitless) {
   if (d == null) return h("span", { class: "delta flat" }, "");
   const dir = d > 0 ? 1 : d < 0 ? -1 : 0;
@@ -146,20 +172,6 @@ function showTip(evt, ...kids) {
 const hideTip = () => { tip.style.display = "none"; };
 
 // ------------------------------------------------------------------ scales
-function linear(d0, d1, r0, r1) {
-  const k = d1 === d0 ? 0 : (r1 - r0) / (d1 - d0);
-  const f = v => r0 + (v - d0) * k;
-  f.inv = px => k ? d0 + (px - r0) / k : d0;
-  return f;
-}
-function niceTicks(lo, hi, n = 5) {
-  if (hi === lo) { hi = lo + 1; }
-  const raw = (hi - lo) / n, mag = 10 ** Math.floor(Math.log10(raw));
-  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(st => st >= raw) || 10 * mag;
-  const t0 = Math.floor(lo / step) * step, out = [];
-  for (let v = t0; v <= hi + step * 0.5; v += step) out.push(+v.toFixed(10));
-  return out;
-}
 // x ticks on the g axis: labelled by turn within the age, plus the age starts
 function gTicks(x0, x1, widthPx) {
   const span = x1 - x0, steps = [1, 2, 5, 10, 20, 25, 50, 100];
@@ -173,6 +185,28 @@ function gTicks(x0, x1, widthPx) {
   }
   return ticks;
 }
+// Plot x scale over the game-wide turn index g, ticked and labelled by turn within each age.
+function gScale(x0, x1, widthPx, extra) {
+  return Object.assign({ domain: [x0, x1], ticks: gTicks(x0, x1, widthPx).map(tk => tk.g), label: null,
+    tickFormat: g => { const a = ageAt(g); return a ? `T${g - a.g_offset}` : `g${g}`; } }, extra);
+}
+const ageBounds = (x0, x1) => S.meta.ages.map(a => a.g_offset + 0.5).filter(b => b > x0 && b < x1);
+function ageStarts(x0, x1) {
+  const cg = S.meta.game.current_g;
+  return S.meta.ages.filter(a => Math.max(x0, a.g_offset + 1) <= x1 && (a.current ? cg : a.end_g) >= x0)
+    .map(a => ({ g: Math.max(x0, a.g_offset + 1), label: ageName(a.age) }));
+}
+// Figures are numbered per view, Foolscap style: "Fig. 2 — ...".
+let figNo = 0;
+const figure = (el, ...caption) => h("figure", { class: "fc-figure" }, el,
+  h("figcaption", { class: "fc-figcaption" }, h("span", { class: "fc-figno" }, `Fig. ${++figNo}`), ...caption));
+// Where the pointer is on a rendered Plot svg, in its own coordinates.
+function svgPoint(svg, evt) {
+  const r = svg.getBoundingClientRect(), w = +svg.getAttribute("width"), ht = +svg.getAttribute("height");
+  return { px: (evt.clientX - r.left) * (w / r.width), py: (evt.clientY - r.top) * (ht / r.height) };
+}
+const svgEl = (tag, attrs) => s(tag, attrs);
+
 function xDomainFor(range) {
   const ages = S.meta.ages, cg = S.meta.game.current_g;
   if (range && range !== "all") {
@@ -186,10 +220,12 @@ function xDomainFor(range) {
 function renderHeader() {
   const m = S.meta;
   const gl = $("#gameline");
-  if (!m || !m.game) { gl.textContent = "No game in the store yet — run `civilizer monitor` or `civilizer refresh`."; return; }
+  if (S.tab === "home") { gl.textContent = ""; renderMonitor(m?.monitor); return; }
+  if (!m || !m.game) { gl.textContent = `Game ${S.game} is not in the store.`; return; }
   const g = m.game, me = S.players[S.local];
-  gl.replaceChildren(h("b", {}, me ? me.leader : pretty(g.leader)), ` · ${pciv(S.local) || pretty(g.civilization)} · ${pretty(g.difficulty)} · `,
-    `${ageName(g.current_age)} turn ${g.current_turn}${g.age_turns_max ? ` of ${g.age_turns_max}` : ""}`);
+  gl.replaceChildren(statusIcon(g.outcome), h("b", {}, me ? me.leader : pretty(g.leader)),
+    h("span", { class: "wide" }, ` · ${pciv(S.local) || pretty(g.civilization)} · ${pretty(g.difficulty)}`), " · ",
+    `${ageName(g.current_age)} T${g.current_turn}`, h("span", { class: "wide" }, g.age_turns_max ? `/${g.age_turns_max}` : ""));
   renderMonitor(m.monitor);
 }
 function renderMonitor(mon) {
@@ -202,11 +238,16 @@ function renderMonitor(mon) {
   else if (st === "game_unavailable") { color = "var(--warning)"; text = `Game not reachable · ${ago(mon.age_s)}`; }
   else if (st === "error") { color = "var(--critical)"; text = "Monitor error"; }
   else if (st === "stopped") { text = `Monitor stopped · ${ago(mon.age_s)}`; }
-  el.replaceChildren(h("span", { class: "dot", style: `background:${color}` }), text);
-  el.title = [`state: ${st}`, mon.pid ? `pid ${mon.pid}` : null, mon.last_g ? `last turn ${gLabel(mon.last_g)}` : null,
+  // the header shows only the dot; the words live in the tooltip
+  el.replaceChildren(h("span", { class: "dot", style: `background:${color}` }));
+  el.title = [text, `state: ${st}`, mon.pid ? `pid ${mon.pid}` : null, mon.last_g ? `last turn ${gLabel(mon.last_g)}` : null,
     mon.interval ? `poll every ${mon.interval}s` : null, mon.last_error ? `error: ${mon.last_error}` : null].filter(Boolean).join("\n");
-  const lr = mon.last_refresh;
-  rf.textContent = lr?.at ? `Store refreshed ${ago(sinceIso(lr.at))}` : (S.meta?.game?.updated_at ? `Store refreshed ${ago(sinceIso(S.meta.game.updated_at))}` : "");
+  el.setAttribute("aria-label", text);
+  const at = mon.last_refresh?.at || S.meta?.game?.updated_at;
+  const sec = at ? sinceIso(at) : null;
+  rf.textContent = sec == null ? "" : sec < 3600 ? "<1h" : `${Math.floor(sec / 3600)}h`;
+  rf.title = sec == null ? "" : `Store refreshed ${ago(sec)}`;
+  rf.hidden = sec == null;
 }
 
 async function loadMeta() {
@@ -225,15 +266,18 @@ async function poll() {
     else S.token = v.token;
   } catch (e) {
     const el = $("#monitor");
-    el.replaceChildren(h("span", { class: "dot", style: "background:var(--critical)" }), "Dashboard server unreachable");
+    el.replaceChildren(h("span", { class: "dot", style: "background:var(--critical)" }));
+    el.title = "Dashboard server unreachable";
+    el.setAttribute("aria-label", el.title);
   }
 }
 
 // ------------------------------------------------------------------ router
-const VIEWS = { overview: viewOverview, story: viewStory, timeline: viewTimeline, charts: viewCharts, turn: viewTurn, advisor: viewAdvisor };
+const VIEWS = { home: viewHome, overview: viewOverview, story: viewStory, timeline: viewTimeline, charts: viewCharts, turn: viewTurn, advisor: viewAdvisor };
+// Two levels: the Games index (no ?game=) and one game's analyses (?game=<seed>#overview, #story, ...).
 function parseHash() {
-  const [tab, arg] = (location.hash.replace(/^#/, "") || "overview").split("/");
-  S.tab = VIEWS[tab] ? tab : "overview";
+  const [tab, arg] = (location.hash.replace(/^#/, "") || (S.game ? "overview" : "home")).split("/");
+  S.tab = S.game && VIEWS[tab] ? tab : "home";
   if (S.tab === "turn") S.turn.g = arg && /^\d+$/.test(arg) ? +arg : null;
 }
 let renderSeq = 0;
@@ -244,11 +288,14 @@ async function refresh() {
     await loadMeta();
     renderHeader();
     for (const a of document.querySelectorAll("#tabs a")) a.classList.toggle("on", a.dataset.tab === S.tab);
-    if (!S.meta.game) {
-      main.replaceChildren(empty(h("b", {}, "The store has no game yet. "), "Start the monitor (", h("code", {}, "uv run civilizer monitor"),
-        ") or run ", h("code", {}, "uv run civilizer refresh"), "; this page updates by itself."));
+    $("#tabs").hidden = $("#crumb").hidden = S.tab === "home";
+    if (!S.meta.game && S.tab !== "home") {
+      main.replaceChildren(S.game
+        ? empty(h("b", {}, `Game ${S.game} is not in the store. `), h("a", { href: "/#home" }, "Pick a game"), ".")
+        : empty(h("b", {}, "The store has no game yet. "), h("a", { href: "/#home" }, "See how to start one"), "; this page updates by itself."));
       return;
     }
+    figNo = 0;
     const node = await VIEWS[S.tab]();
     if (seq !== renderSeq) return;
     main.replaceChildren(node);
@@ -263,6 +310,55 @@ async function refresh() {
 }
 const go = hash => { if (location.hash === hash) refresh(); else location.hash = hash; };
 
+// ------------------------------------------------------------------ home
+async function viewHome() {
+  const d = await api("/api/games");
+  const mon = d.monitor || {};
+  const list = d.games.length
+    ? h("ol", { class: "gamelist" }, d.games.map(gameRow))
+    : empty(h("b", {}, "No games recorded yet. "), "Follow the steps below; a game shows up here after its first turn.");
+  return h("div", {},
+    h("div", { class: "cardhead pagehead" }, h("h1", {}, "Games"), h("span", { class: "lab muted" }, `${d.games.length} recorded · pick one to analyse`)),
+    list,
+    h("div", { class: "section" }, newGameCard(mon)));
+}
+function gameRow(g) {
+  const civs = (g.ages || []).map(a => (g.civilizations || {})[a]).filter((c, i, xs) => c && c !== xs[i - 1]);
+  return h("li", {}, h("a", { class: "gamerow", href: gameHref(g.game) },
+    statusIcon(g.outcome),
+    h("div", { class: "gr-body" },
+      h("div", { class: "gr-title" }, h("span", { class: "gr-leader" }, g.leader_name || pretty(g.leader)),
+        h("span", { class: "sec" }, civs.length ? civs.join(" → ") : pretty(g.civilization)),
+        g.watching ? h("span", { class: "pill" }, h("span", { class: "dot", style: "background:var(--good)" }), "Monitor live") : null),
+      h("div", { class: "sec" }, outcomeText(g.outcome), ` · ${ageName(g.current_age)} turn ${g.current_turn ?? "—"}${g.age_turns_max ? ` of ${g.age_turns_max}` : ""}`,
+        ` · ${g.turns_observed} turn${g.turns_observed === 1 ? "" : "s"} recorded`),
+      h("div", { class: "small muted" }, [pretty(g.difficulty), g.map, pretty(g.map_size), pretty(g.speed), `seed ${g.game}`, `updated ${ago(sinceIso(g.updated_at))}`]
+        .filter(Boolean).join(" · "))),
+    h("span", { class: "gr-go lab", "aria-hidden": "true" }, "Open →")));
+}
+function newGameCard(mon) {
+  const live = mon.state === "watching" && !mon.stale, waiting = mon.state === "game_unavailable" && !mon.stale;
+  const status = live ? "The monitor is running and the game is reachable. Start or load a game; it shows up in the list after you end a turn."
+    : waiting ? "The monitor is running but can't reach the game yet. Launch Civ VII (step 1)."
+    : "The monitor isn't running, so no turns are being recorded. Start it with step 2.";
+  const cmd = c => h("pre", { class: "cmd" }, h("code", {}, c));
+  return card({ class: "card fc-plate" }, h("h2", {}, "Start a new game with Civilizer"),
+    h("div", { class: "empty", style: "margin-bottom:12px" }, h("b", {}, live ? "Ready. " : "Not recording. "), status),
+    h("ol", { class: "steps" },
+      h("li", {}, h("b", {}, "Launch Civ VII. "), "Civilizer reads the game through its UI debugger on port 9444, which is on by default. If ",
+        h("code", {}, "AppOptions.txt"), " has an uncommented ", h("code", {}, "UIDebugger 0"), ", set it to 1 and restart the game."),
+      h("li", {}, h("b", {}, "Start Civilizer. "), "In a terminal, run:", cmd("cd ~/src/civilizer && uv run civilizer up"),
+        "This serves this dashboard and starts the monitor. The monitor waits at the main menu. If a monitor or dashboard is already running, ",
+        h("code", {}, "up"), " reuses it."),
+      h("li", {}, h("b", {}, "Start the game. "), "Pick New Game in Civ VII. The game appears in the list after you end your first turn. ",
+        "Until the first autosave, leader and difficulty come from the live game and the map name is unknown."),
+      h("li", {}, h("b", {}, "Talk to the advisor (optional). "), "Open Claude Code in the repo:", cmd("cd ~/src/civilizer && claude"),
+        "Tell it how you like to play and what you're going for. It records a profile, strategy and goals, and those appear on the Advisor tab.")),
+    h("p", { class: "small muted", style: "margin-top:10px" }, "If you played without the monitor, run ", h("code", {}, "uv run civilizer archive-logs"),
+      " before you relaunch Civ VII, because the game wipes its logs at launch. ", h("code", {}, "uv run civilizer refresh"),
+      " rebuilds the store from what's archived."));
+}
+
 // ------------------------------------------------------------------ overview
 async function viewOverview() {
   const o = await api("/api/overview");
@@ -270,7 +366,7 @@ async function viewOverview() {
   const ages = S.meta.ages;
   const cur = ages.find(a => a.current) || ages[ages.length - 1];
 
-  const civs = ages.map(a => h("span", { class: "chip" }, ageName(a.age), " ", h("b", {}, (me.civilizations || {})[a.age] || "?")));
+  const civs = ages.map(a => h("span", { class: "fc-chip chip" }, ageName(a.age), " ", h("b", {}, (me.civilizations || {})[a.age] || "?")));
   const character = card({},
     h("div", { class: "row" }, swatch(S.local), h("span", { class: "leader" }, me.leader || pretty(g.leader))),
     h("div", { class: "sec", style: "margin-top:2px" }, [pciv(S.local), pretty(g.difficulty), g.map, pretty(g.map_size), pretty(g.speed)].filter(Boolean).join(" · ")),
@@ -280,7 +376,8 @@ async function viewOverview() {
     h("div", { class: "small muted", style: "margin-top:4px" }, `Build ${g.app_version || "?"} · game ${g.game}`));
 
   const totalMax = ages.reduce((n, a) => n + (a.turns_max || a.turns), 0);
-  const progress = card({},
+  const progress = card({ class: "card fc-plate" },  // the one plated element on this view
+    h("div", { class: "row outcome" }, statusIcon(g.outcome), h("span", { class: "lab" }, outcomeText(g.outcome))),
     h("div", { class: "sec small" }, `${ageName(g.current_age)} age`),
     h("div", { class: "row", style: "align-items:baseline;gap:8px" }, h("span", { class: "herofig" }, `Turn ${g.current_turn}`),
       g.age_turns_max ? h("span", { class: "sec" }, `of ${g.age_turns_max} · ${pct(g.current_turn / g.age_turns_max)} through the age`) : null),
@@ -290,9 +387,10 @@ async function viewOverview() {
     })),
     h("div", { class: "agelabels" }, ages.map(a => h("div", { style: `width:${(a.turns_max || a.turns) / totalMax * 100}%` },
       `${ageName(a.age)} ${a.current ? `${g.current_turn}/${a.turns_max}` : a.turns}`))),
+    o.blurb ? h("p", { class: "blurb", style: "margin:12px 0 0" }, o.blurb) : null,
     h("div", { class: "tagline", style: "margin-top:12px" }, o.phases.filter(p => p.scope === "game" || p.scope === "age").map(p =>
-      h("a", { href: "#story", style: "text-decoration:none" }, h("span", { class: "chip" }, p.scope === "game" ? "Game" : ageName(p.scope_key)),
-        " ", badge(p.verdict, p.verdict_source === "advisor" ? "advisor" : null)))));
+      h("a", { href: "#story", style: "text-decoration:none" }, h("span", { class: "fc-chip chip" }, p.scope === "game" ? "Game" : ageName(p.scope_key)),
+        " ", badge(p.outcome, p.outcome_source === "advisor" ? "advisor" : null)))));
 
   const tiles = h("div", { class: "grid tiles" }, o.tiles.map(t => card({ class: "card tile" },
     h("div", { class: "lab" }, t.label),
@@ -306,24 +404,20 @@ async function viewOverview() {
     const leader = st.leader;
     return card({},
       h("div", { class: "cardhead" }, h("h3", {}, k === "score" ? "Score" : k[0].toUpperCase() + k.slice(1)), h("span", { class: "sp" }),
-        st.rank ? h("span", { class: "chip" }, h("b", {}, `#${st.rank}`), ` of ${st.of}`) : null),
+        st.rank ? h("span", { class: "fc-chip chip" }, h("b", {}, `#${st.rank}`), ` of ${st.of}`) : null),
       st.target ? h("div", { style: "margin-bottom:8px" },
         h("div", { class: "row small" }, h("span", {}, h("b", {}, fmt(st.value)), ` / ${fmt(st.target)} to win`), h("span", { class: "sp" }), h("span", { class: "sec" }, pct(st.value / st.target))),
         meter(st.value / st.target, st.value >= st.target ? "met" : "")) : null,
       leader && leader.player_id !== S.local ? h("div", { class: "small sec", style: "margin-bottom:6px" }, `Leader: ${pname(leader.player_id)} with ${fmt(leader.value)}`)
         : h("div", { class: "small sec", style: "margin-bottom:6px" }, "You lead this path"),
-      h("div", { class: "sbars" }, st.rows.map(r => [
-        swatch(r.player_id), h("span", { class: `nm ${r.player_id === S.local ? "me" : ""}`, title: `${pname(r.player_id)} · ${pciv(r.player_id)}` }, pname(r.player_id, true)),
-        h("span", { class: "track" }, h("i", { style: `width:${r.value / max * 100}%;background:${pcolor(r.player_id)}` }),
-          st.target ? h("u", { style: `left:${st.target / max * 100}%`, title: `target ${fmt(st.target)}` }) : null),
-        h("span", { class: "v" }, fmt(r.value))])));
+      standingsBars(st, max));
   }));
 
   const majorWars = o.wars.filter(w => w.major), minorWars = o.wars.filter(w => !w.major);
   const warRow = w => h("li", {}, h("div", { class: "row" }, swatch(w.opponent), h("b", {}, pname(w.opponent)), w.major ? h("span", { class: "sec small" }, pciv(w.opponent)) : null,
-    h("span", { class: "sp" }), h("span", { class: "small" }, `kills ${w.units_killed} · losses ${w.units_lost}`)),
+    h("span", { class: "sp" }), h("span", { class: "small" }, `kills ${w.units_killed} · losses ${w.units_lost}${w.war_support != null ? ` · support ${fmtSigned(w.war_support)}` : ""}`)),
     h("div", { class: "small sec" }, `${w.war_type || "War"} since ${gLabel(w.since_g)} (${w.turns} turns) · declared by ${w.declared_by === S.local ? "you" : pname(w.declared_by)}`));
-  const wars = card({}, h("div", { class: "cardhead" }, h("h2", {}, "Wars"), h("span", { class: "sp" }), h("span", { class: "chip" }, `${majorWars.length} major · ${minorWars.length} independent`)),
+  const wars = card({}, h("div", { class: "cardhead" }, h("h2", {}, "Wars"), h("span", { class: "sp" }), h("span", { class: "fc-chip chip" }, `${majorWars.length} major · ${minorWars.length} independent`)),
     o.wars.length ? h("ul", { class: "plain" }, majorWars.map(warRow),
       minorWars.length ? h("li", {}, h("details", {}, h("summary", {}, `${minorWars.length} wars with independent powers`), h("ul", { class: "plain" }, minorWars.map(warRow)))) : null)
       : empty("At peace."));
@@ -336,11 +430,31 @@ async function viewOverview() {
     h("div", { class: "section grid g2" }, wars, phaseSummaryCard(o.phases)));
 }
 
+function standingsBars(st, max) {
+  const el = h("div", { class: "chart" });
+  const short = n => n.length > 18 ? n.slice(0, 17) + "…" : n;
+  const rows = st.rows.map(r => ({ ...r, name: short(pname(r.player_id, true)) + (r.player_id === S.local ? " ◂" : "") }));
+  fcChart(el, t => ({
+    height: rows.length * 20 + 24, marginLeft: 140, marginRight: 48, marginTop: 4, marginBottom: 20,
+    color: { type: "identity" },
+    x: { domain: [0, max], ticks: 3, tickFormat: fmt, label: null },
+    y: { domain: rows.map(r => r.name), label: null, grid: false, tickSize: 0 },
+    marks: [
+      Plot.barX(rows, { x: "value", y: "name", fill: r => pcolorT(r.player_id, t), insetTop: 4, insetBottom: 4 }),
+      st.target ? Plot.ruleX([st.target], { stroke: t.ink, strokeDasharray: "3,2" }) : null,
+      Plot.text(rows, { x: "value", y: "name", text: r => fmt(r.value), textAnchor: "start", dx: 4, fill: t.axis }),
+      Plot.tip(rows, Plot.pointerY({ x: "value", y: "name",
+        title: r => `${pname(r.player_id)} · ${pciv(r.player_id)}\n${fmt(r.value)}${st.target ? ` of ${fmt(st.target)} to win` : ""}` })),
+    ],
+  }));
+  return el;
+}
+
 function phaseSummaryCard(phases) {
   const wars = phases.filter(p => p.scope === "war"), goals = phases.filter(p => p.scope === "goal");
   return card({}, h("div", { class: "cardhead" }, h("h2", {}, "Phases & initiatives"), h("span", { class: "sp" }), h("a", { href: "#story", class: "small" }, "Read the story →")),
     h("ul", { class: "plain" }, [...phases.filter(p => p.scope !== "goal" || goals.length), ].map(p => h("li", {}, h("div", { class: "row" },
-      h("span", {}, phaseTitle(p)), h("span", { class: "sp" }), h("span", { class: "small muted" }, gRange(p.g_start, p.g_end)), badge(p.verdict))))),
+      h("span", {}, phaseTitle(p)), h("span", { class: "sp" }), h("span", { class: "small muted" }, gRange(p.g_start, p.g_end)), badge(p.outcome))))),
     !wars.length ? h("div", { class: "small muted", style: "margin-top:6px" }, "No wars against major civs recorded.") : null);
 }
 function phaseTitle(p) {
@@ -353,16 +467,15 @@ function phaseTitle(p) {
   return p.title || `Goal ${p.scope_key}`;
 }
 
-function sparkline(pts, w = 84, ht = 26) {
+function sparkline(pts) {
   if (!pts || pts.length < 2) return null;
-  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
-  const x = linear(Math.min(...xs), Math.max(...xs), 2, w - 4), lo = Math.min(...ys), hi = Math.max(...ys);
-  const y = linear(lo, hi === lo ? lo + 1 : hi, ht - 4, 4);
-  const d = pts.map((p, i) => `${i ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
-  const last = pts[pts.length - 1];
-  return s("svg", { width: w, height: ht, viewBox: `0 0 ${w} ${ht}`, "aria-hidden": "true", style: "display:block;margin-left:auto" },
-    s("path", { d, fill: "none", stroke: "var(--muted)", "stroke-width": 1.5, "stroke-linejoin": "round", "stroke-linecap": "round" }),
-    s("circle", { cx: x(last[0]), cy: y(last[1]), r: 3, fill: "var(--accent)", stroke: "var(--surface)", "stroke-width": 1.5 }));
+  const el = h("div", { class: "spark", "aria-hidden": "true" }), last = pts[pts.length - 1];
+  fcChart(el, t => ({
+    width: 84, height: 26, margin: 4, axis: null, x: { grid: false }, y: { grid: false },
+    marks: [Plot.lineY(pts, { x: d => d[0], y: d => d[1], stroke: t.axis, strokeWidth: 1.5 }),
+      Plot.dot([last], { x: d => d[0], y: d => d[1], r: 2.5, fill: t.ink })],
+  }));
+  return el;
 }
 
 // ------------------------------------------------------------------ story
@@ -372,14 +485,14 @@ async function viewStory() {
   const cards = sc => ps.filter(p => p.scope === sc).map(phaseCard);
   return h("div", {},
     h("div", { class: "cardhead" }, h("h2", {}, "The story so far"), h("span", { class: "hint" },
-      "Facts are computed from the store; narratives and final verdicts are written by the advisor (Claude) as annotations.")),
+      "Facts are computed from the store; narratives and final outcomes are written by the advisor (Claude) as annotations.")),
     h("div", { class: "grid" }, cards("game")),
     h("div", { class: "section" }, h("h2", {}, "Ages"), h("div", { class: "grid g3" }, cards("age"))),
     h("div", { class: "section" }, h("h2", {}, "Wars"), ps.some(p => p.scope === "war") ? h("div", { class: "grid g3" }, cards("war"))
       : empty("No wars with major civilizations so far.")),
     h("div", { class: "section" }, h("h2", {}, "Goals"), ps.some(p => p.scope === "goal") ? h("div", { class: "grid g3" }, cards("goal"))
       : empty(h("b", {}, "No goals yet. "), "Tell Claude what you are aiming for (\"economic victory by Modern turn 120\"); it records goals with ",
-        h("code", {}, "add_goal"), " and they appear here with progress and a verdict.")),
+        h("code", {}, "add_goal"), " and they appear here with progress and an outcome.")),
     d.unscoped.length ? h("div", { class: "section" }, h("h2", {}, "Other narrative notes"), card({}, d.unscoped.map(noteEl))) : null,
     h("div", { class: "section" }, h("h2", {}, "Intentions & priority changes"), notesStrip(d.notes)));
 }
@@ -391,8 +504,8 @@ function phaseCard(p) {
   const scopeHint = p.scope === "age" ? `age ${p.scope_key}` : `${p.scope} ${p.scope_key}`;
   return card({ class: "card phase" },
     h("div", { class: "cardhead" }, h("h3", {}, phaseTitle(p)), h("span", { class: "small muted" }, gRange(p.g_start, p.g_end)), h("span", { class: "sp" }),
-      badge(p.verdict, p.verdict_source)),
-    p.verdict_source === "advisor" && p.heuristic_verdict !== p.verdict ? h("div", { class: "small muted" }, `Heuristic said: ${VERDICT[p.heuristic_verdict]?.[1] || p.heuristic_verdict}`) : null,
+      badge(p.outcome, p.outcome_source)),
+    p.outcome_source === "advisor" && p.heuristic_outcome !== p.outcome ? h("div", { class: "small muted" }, `Heuristic said: ${OUTCOME[p.heuristic_outcome]?.[1] || p.heuristic_outcome}`) : null,
     h("div", { class: "facts" }, phaseFacts(p, f)),
     h("div", { class: "narr" },
       narr.length ? narr.map(noteEl) : empty("No advisor narrative yet — ask Claude to tell the story of this ", p.scope === "game" ? "game" : p.scope,
@@ -405,15 +518,27 @@ function phaseCard(p) {
 
 function noteEl(a) {
   return h("div", { class: "note" },
-    h("div", { class: "row when" }, h("span", { class: "kind" }, a.kind.replace("_", " ")), `${gLabel(a.g)} · ${a.author}`, a.verdict ? badge(a.verdict) : null),
-    h("p", {}, a.text));
+    h("div", { class: "row when" }, h("span", { class: "kind" }, a.kind.replace("_", " ")), `${gLabel(a.g)} · ${a.author}`, a.outcome ? badge(a.outcome) : null),
+    a.kind === "narrative" ? narrativeEl(a.text) : h("p", {}, a.text));
+}
+
+// A narrative's first paragraph is its title when it is a single short line; "IV. Subtitle (T109–T147)" lines are
+// chapter headings (docs/NARRATIVES.md).
+function narrativeEl(text) {
+  const paras = text.split(/\n\n+/), out = [];
+  paras.forEach((t, i) => {
+    if (i === 0 && paras.length > 1 && !t.includes("\n") && t.length <= 120) out.push(h("h4", { class: "narr-title" }, t));
+    else if (/^[IVXL]+\. .{1,100}$/.test(t)) out.push(h("h5", { class: "narr-chapter" }, t));
+    else out.push(h("p", {}, t));
+  });
+  return h("div", { class: "narrative" }, out);
 }
 
 function phaseFacts(p, f) {
   if (p.scope === "game") {
     const st = f.standings_now || {};
     return h("div", {},
-      h("div", { class: "tagline" }, Object.entries(f.age_verdicts || {}).map(([a, v]) => h("span", { class: "chip" }, ageName(a), " ", badge(v)))),
+      h("div", { class: "tagline" }, Object.entries(f.age_outcomes || {}).map(([a, v]) => h("span", { class: "fc-chip chip" }, ageName(a), " ", badge(v)))),
       standingsChips(st));
   }
   if (p.scope === "age") {
@@ -421,7 +546,7 @@ function phaseFacts(p, f) {
     const rows = Object.entries(m).filter(([, v]) => v && (v.start != null || v.end != null));
     const cat = Object.fromEntries((S.meta.catalog || []).map(c => [c.metric, c]));
     return h("div", {},
-      rows.length ? h("table", { class: "t" }, h("tr", {}, h("th", {}, "Metric"), h("th", { class: "n" }, "Start"), h("th", { class: "n" }, "End"), h("th", { class: "n" }, "Change")),
+      rows.length ? h("table", { class: "fc-table" }, h("tr", {}, h("th", {}, "Metric"), h("th", { class: "n" }, "Start"), h("th", { class: "n" }, "End"), h("th", { class: "n" }, "Change")),
         rows.map(([k, v]) => h("tr", {}, h("td", {}, cat[k]?.label || k), h("td", { class: "n" }, fmt(v.start)), h("td", { class: "n" }, fmt(v.end)),
           h("td", { class: "n" }, v.start ? deltaSpan(v.end - v.start, cat[k]?.higher_is_better) : "—"))))
         : h("div", { class: "small muted" }, "No per-turn yields recorded for this age (logs not archived)."),
@@ -437,17 +562,29 @@ function phaseFacts(p, f) {
         f.wonders?.length ? [h("dt", {}, "Wonders"), h("dd", {}, f.wonders.map(x => x.subject || x).join(", "))] : null));
   }
   if (p.scope === "war") {
+    const cb = f.casus_belli || {}, cs = f.combatants, ws = f.war_support, nb = f.notable || {}, ally = cb.joined_ally_war;
+    const who = x => x?.id === S.local ? "you" : x?.name || pname(x?.id);
+    const side = s => [...(s.majors || []).map(who), ...(s.city_states || []).map(c => c.name || `#${c.id}`)].join(", ");
+    const peaks = (nb.peak_kill_turns || []).map(k => `${k.killed} in ${gLabel(k.g)}`).join(", ");
     return h("dl", { class: "kv" },
       h("dt", {}, "Opponent"), h("dd", {}, h("span", { class: "row", style: "gap:6px" }, swatch(f.opponent), pname(f.opponent), h("span", { class: "muted" }, pciv(f.opponent)))),
       h("dt", {}, "Declared by"), h("dd", {}, f.declared_by === S.local ? "You" : pname(f.declared_by), f.war_type ? ` · ${f.war_type}` : ""),
+      ally ? [h("dt", {}, "Ally's war"), h("dd", {}, `${who(ally.ally)} at war with them since ${gLabel(ally.ally_war_start_g)} (declared by ${who(ally.declared_by)})`)] : null,
+      cb.run_up?.length ? [h("dt", {}, "Run-up"), h("dd", { class: "small" }, cb.run_up.map(r => `${gLabel(r.g)} ${r.what} (${r.by})`).join(" · "))] : null,
+      cs ? [h("dt", {}, "Sides"), h("dd", { class: "small" }, side(cs.us), h("span", { class: "muted" }, " vs "), side(cs.them))] : null,
       h("dt", {}, "Duration"), h("dd", {}, `${f.turns ?? "?"} turns${f.ongoing ? " (ongoing)" : ""}`),
-      h("dt", {}, "Combat"), h("dd", {}, `${f.units_killed ?? 0} destroyed · ${f.units_lost ?? 0} lost`),
-      h("dt", {}, "Settlements"), h("dd", {}, `${(f.captured || []).length} captured · ${(f.lost || []).length} lost`));
+      h("dt", {}, "Combat"), h("dd", {}, `${f.units_killed ?? 0} destroyed · ${f.units_lost ?? 0} lost`, peaks ? h("span", { class: "muted" }, ` · peak ${peaks}`) : ""),
+      ws ? [h("dt", {}, "War support"), h("dd", { class: "row", style: "gap:6px" }, sparkline(ws.series), `${fmtSigned(ws.last)} now · range ${fmtSigned(ws.min)} to ${fmtSigned(ws.max)}`)] : null,
+      h("dt", {}, "Settlements"), nb.settlements?.length
+        ? h("dd", { class: "small" }, nb.settlements.map(s => `${gLabel(s.g)} ${s.event} ${s.settlement}${s.capital ? " (capital)" : ""}${s.to ? ` to ${s.to}` : ""}`).join(" · "))
+        : h("dd", {}, `${(f.captured || []).length} captured · ${(f.lost || []).length} lost`),
+      nb.upsets?.length ? [h("dt", {}, "Upsets"), h("dd", {}, nb.upsets.map(u => h("div", { class: "warnline small" },
+        `${gLabel(u.g)} ${u.what.replace("_", " ")}: ${u.settlement || ""}${u.settlement && u.player ? ", " : ""}${u.player || ""}`)))] : null);
   }
   if (p.scope === "goal") {
     return h("div", {}, h("div", { class: "row small" }, h("span", { class: "status" }, f.status || ""), h("span", {}, `${f.horizon || ""}-term`),
       f.overdue ? h("span", { class: "warnline" }, "overdue") : null, h("span", { class: "sp" }), pct(f.progress)), meter(f.progress, f.progress >= 1 ? "met" : ""),
-      (f.metrics || []).length ? h("table", { class: "t", style: "margin-top:6px" }, (f.metrics || []).map(m => h("tr", {},
+      (f.metrics || []).length ? h("table", { class: "fc-table", style: "margin-top:6px" }, (f.metrics || []).map(m => h("tr", {},
         h("td", {}, m.label || m.metric), h("td", { class: "n" }, `${m.comparator} ${fmt(m.target)}`), h("td", { class: "n" }, fmt(m.current)),
         h("td", { class: "n" }, m.met ? "✓ met" : pct(m.progress))))) : null);
   }
@@ -459,7 +596,7 @@ function standingsChips(st) {
   if (!keys.length) return null;
   return h("div", { class: "tagline" }, keys.map(k => {
     const r = st[k];
-    return h("span", { class: "chip", title: r.leader !== S.local ? `Leader: ${pname(r.leader)} (${fmt(r.leader_value)})` : "You lead" },
+    return h("span", { class: "fc-chip chip", title: r.leader !== S.local ? `Leader: ${pname(r.leader)} (${fmt(r.leader_value)})` : "You lead" },
       `${k[0].toUpperCase() + k.slice(1)} `, h("b", {}, `#${r.rank}/${r.of}`), ` ${fmt(r.value)}`);
   }));
 }
@@ -468,23 +605,25 @@ function notesStrip(notes) {
   if (!notes.length) return empty(h("b", {}, "No intentions or priority changes recorded yet. "),
     "When you tell Claude what you plan or change course, it records an ", h("code", {}, "intention"), " / ", h("code", {}, "priority_change"),
     " note; they line up here on the turn axis.");
-  const wrap = card({});
-  const draw = () => {
-    const W = Math.max(400, wrap.clientWidth - 32), H = 54, [x0, x1] = xDomainFor("all");
-    const x = linear(x0, x1, 8, W - 8);
-    const svg = s("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}` },
-      S.meta.ages.map(a => [s("line", { class: "agel", x1: x(a.g_offset + 0.5), x2: x(a.g_offset + 0.5), y1: 0, y2: H - 18 }),
-        s("text", { class: "agelab", x: x(a.g_offset + 0.5) + 4, y: 11 }, ageName(a.age))]),
-      s("line", { class: "gridl", x1: 8, x2: W - 8, y1: 32, y2: 32 }),
-      notes.map(n => s("circle", { cx: x(n.g), cy: 32, r: 5, fill: n.kind === "intention" ? "var(--p0)" : "var(--p1)", stroke: "var(--surface)", "stroke-width": 2,
-        style: "cursor:pointer", onpointermove: e => showTip(e, h("div", { class: "tt" }, `${gLabel(n.g)} · ${n.kind.replace("_", " ")}`), h("div", {}, n.text)),
-        onpointerleave: hideTip, onclick: () => go(`#turn/${n.g}`) })));
-    wrap.replaceChildren(h("div", { class: "legend" }, h("span", { class: "row small" }, h("span", { class: "dot", style: "background:var(--p0)" }), "intention"),
-      h("span", { class: "row small" }, h("span", { class: "dot", style: "background:var(--p1)" }), "priority change")), svg,
-      h("div", { style: "margin-top:8px" }, notes.slice().reverse().map(noteEl)));
-  };
-  requestAnimationFrame(draw);
-  return wrap;
+  const box = h("div", { class: "chart" }), [x0, x1] = xDomainFor("all");
+  const kindColor = (n, t) => n.kind === "intention" ? t.series[0] : t.series[1];
+  fcChart(box, t => ({
+    height: 64, marginLeft: 8, marginRight: 8, marginTop: 20, marginBottom: 20,
+    color: { type: "identity" },
+    x: gScale(x0, x1, box.clientWidth - 16), y: { axis: null, grid: false, domain: [0, 1] },
+    marks: [
+      Plot.ruleX(ageBounds(x0, x1), { stroke: t.axis }),
+      Plot.text(ageStarts(x0, x1), { x: "g", text: "label", frameAnchor: "top", textAnchor: "start", dx: 4, dy: -14, fill: t.ink }),
+      Plot.ruleY([0.5], { stroke: t.grid }),
+      Plot.dot(notes, { x: "g", y: () => 0.5, r: 5, fill: n => kindColor(n, t), stroke: cssVar("--fc-color-surface-raised"), strokeWidth: 1.5 }),
+      Plot.tip(notes, Plot.pointerX({ x: "g", y: () => 0.5, title: n => `${gLabel(n.g)} · ${n.kind.replace("_", " ")}\n${n.text}` })),
+    ],
+  }), { onRender: plot => plot.addEventListener("click", () => plot.value && go(`#turn/${plot.value.g}`)) });
+  return card({},
+    h("div", { class: "legend" }, h("span", { class: "row small" }, h("span", { class: "dot", style: "background:var(--p0)" }), "intention"),
+      h("span", { class: "row small" }, h("span", { class: "dot", style: "background:var(--p1)" }), "priority change")),
+    figure(box, "Intentions and priority changes on the turn axis. Click a mark to open that turn."),
+    h("div", { style: "margin-top:8px" }, notes.slice().reverse().map(noteEl)));
 }
 
 // ------------------------------------------------------------------ timeline
@@ -512,7 +651,7 @@ const laneOf = Object.fromEntries(LANES.flatMap(([k, , kinds]) => kinds.map(x =>
 function evRow(e, localMode) {
   const me = S.local, d = e.detail || {}, owner = e.players[0];
   const other = e.players.find(p => p !== me);
-  const per = (pid, sub) => ({ id: `p${pid}${sub ? ":" + sub : ""}`, label: (sub ? sub + " · " : "") + pname(pid, true), color: pcolor(pid), order: pid, sw: pid });
+  const per = (pid, sub) => ({ id: `p${pid}${sub ? ":" + sub : ""}`, label: (sub ? sub + " · " : "") + pname(pid, true), order: pid, sw: pid });
   switch (e.kind) {
     case "government": return localMode ? { id: "gov", label: "Government" } : isMajor(owner) ? per(owner) : null;
     case "settlement": return localMode ? { id: "founded", label: "Founded", order: 0 } : isMajor(owner) ? per(owner) : null;
@@ -535,7 +674,7 @@ function evRow(e, localMode) {
     case "war": {
       if (e.precision === "state") return { id: "warstate", label: "At war (age-end capture)", order: 99 };
       const [a, b] = e.players;
-      if (localMode) return isMajor(other) ? { id: "war" + other, label: pname(other, true), color: pcolor(other), order: other, sw: other }
+      if (localMode) return isMajor(other) ? { id: "war" + other, label: pname(other, true), order: other, sw: other }
         : { id: "warminor", label: "Independents", order: 50 };
       if (isMajor(a) && isMajor(b)) return { id: `war${Math.min(a, b)}-${Math.max(a, b)}`, label: `${pname(Math.min(a, b), true)} – ${pname(Math.max(a, b), true)}`, order: Math.min(a, b) * 10 + Math.max(a, b) };
       const maj = isMajor(a) ? a : isMajor(b) ? b : null;
@@ -555,18 +694,18 @@ function evRow(e, localMode) {
   }
   return null;
 }
-function evColor(e, localMode) {
+function evPlayer(e, localMode) {  // whose colour a timeline mark wears
   const me = S.local, d = e.detail || {};
   if (e.kind === "war" || e.kind === "alliance") {
-    if (!localMode && e.kind === "war") { const [a, b] = e.players; return isMajor(a) && isMajor(b) ? pcolor(Math.max(a, b)) : pcolor(isMajor(a) ? b : a); }
-    return pcolor(e.players.find(p => p !== me) ?? e.players[1]);
+    if (!localMode && e.kind === "war") { const [a, b] = e.players; return isMajor(a) && isMajor(b) ? (Math.max(a, b)) : (isMajor(a) ? b : a); }
+    return (e.players.find(p => p !== me) ?? e.players[1]);
   }
   if (e.kind === "unit_killed") {
     const victim = d.victim ?? e.players[0], killer = d.killer ?? e.players[1];
-    return localMode ? pcolor(killer === me ? victim : killer) : pcolor(killer);
+    return localMode ? (killer === me ? victim : killer) : (killer);
   }
-  if (e.kind === "settlement_captured") return pcolor(d.captured_by ?? e.players[0]);
-  return pcolor(e.players[0]);
+  if (e.kind === "settlement_captured") return (d.captured_by ?? e.players[0]);
+  return (e.players[0]);
 }
 
 function buildLanes(events, localMode) {
@@ -582,7 +721,7 @@ function buildLanes(events, localMode) {
     const lane = lanes.get(lk);
     if (!lane.rows.has(r.id)) lane.rows.set(r.id, Object.assign({ items: [], first: e.start_g }, r));
     const interval = INTERVAL_KINDS.has(e.kind) && e.precision !== "state" && (e.end_g ?? cg) > e.start_g;
-    lane.rows.get(r.id).items.push({ e, x0: e.start_g, x1: interval ? (e.end_g ?? cg) : e.start_g, interval, color: evColor(e, localMode),
+    lane.rows.get(r.id).items.push({ e, x0: e.start_g, x1: interval ? (e.end_g ?? cg) : e.start_g, interval, pid: evPlayer(e, localMode),
       hollow: e.precision !== "exact", shape: e.kind === "settlement_captured" ? "tri" : e.kind === "legacy" || e.kind === "religion_founded" ? "diamond" : e.kind === "purchase" ? "tick" : "dot" });
   }
   const out = [];
@@ -607,142 +746,124 @@ function buildLanes(events, localMode) {
 async function viewTimeline() {
   const d = await api(`/api/timeline?local=${S.tl.local ? 1 : 0}`);
   const root = h("div", {});
-  const box = h("div", { class: "card tl", style: "padding:10px 12px" });
+  const box = h("div", { class: "chart" });
   const ctl = h("div", { class: "controls" },
     h("div", { class: "seg" }, [["Your empire", true], ["All players", false]].map(([l, v]) =>
-      h("button", { class: S.tl.local === v ? "on" : "", onclick: () => { S.tl.local = v; refresh(); } }, l))),
+      h("button", { class: S.tl.local === v ? "fc-chip fc-chip-selected" : "fc-chip", onclick: () => { S.tl.local = v; refresh(); } }, l))),
     h("div", { class: "seg" }, [["all", "Whole game"], ...S.meta.ages.map(a => [a.age, ageName(a.age)])].map(([k, l]) =>
-      h("button", { class: JSON.stringify(S.tl.domain || xDomainFor("all")) === JSON.stringify(xDomainFor(k)) ? "on" : "", onclick: () => { S.tl.domain = xDomainFor(k); refresh(); } }, l))),
-    S.tl.domain && JSON.stringify(S.tl.domain) !== JSON.stringify(xDomainFor("all")) ? h("button", { class: "iconbtn", onclick: () => { S.tl.domain = null; refresh(); } }, "Reset zoom") : null,
+      h("button", { class: JSON.stringify(S.tl.domain || xDomainFor("all")) === JSON.stringify(xDomainFor(k)) ? "fc-chip fc-chip-selected" : "fc-chip", onclick: () => { S.tl.domain = xDomainFor(k); refresh(); } }, l))),
+    S.tl.domain && JSON.stringify(S.tl.domain) !== JSON.stringify(xDomainFor("all")) ? h("button", { class: "fc-btn fc-btn-secondary iconbtn", onclick: () => { S.tl.domain = null; refresh(); } }, "Reset zoom") : null,
     h("span", { class: "sp" }),
     h("details", {}, h("summary", {}, "Lanes"), h("div", { class: "row small" }, LANES.map(([k, l]) => h("label", { class: "row", style: "gap:4px" },
       h("input", { type: "checkbox", checked: !S.tl.off.has(k), onchange: ev => { ev.target.checked ? S.tl.off.delete(k) : S.tl.off.add(k); refresh(); } }), l)))));
-  root.append(ctl, h("div", { class: "hint", style: "margin-bottom:8px" },
-    "Colors follow players (wars, alliances and unit deaths: the other side). Hollow marks: turn known only within a range (end-of-age capture). ",
-    "Drag across the chart to zoom; click a mark to open that turn."), box);
-  const lanes = buildLanes(d.events, S.tl.local);
-  const draw = () => drawTimeline(box, lanes);
-  requestAnimationFrame(draw);
-  onResize(draw);
+  root.append(ctl, h("div", { class: "card tl" }, figure(box, "The game by lane. Colours follow players (wars, alliances and unit deaths: the other side); ",
+    "hollow marks: turn known only within a range (end-of-age capture). Drag across the chart to zoom; click a mark to open that turn.")));
+  drawTimeline(box, buildLanes(d.events, S.tl.local));
   return root;
 }
 
 function drawTimeline(box, lanes) {
-  const LW = 190, W = Math.max(600, box.clientWidth - 24), PW = W - LW - 12;
-  const [x0, x1] = S.tl.domain || xDomainFor("all");
-  const x = linear(x0 - 0.5, x1 + 0.5, LW, LW + PW);
-  const TH = 14, AXIS = 40, cg = S.meta.game.current_g;
-  const rows = [];
-  let y = AXIS + 26;  // ages band takes the first 26px under the axis
+  const ML = 190, TH = 16, [x0, x1] = S.tl.domain || xDomainFor("all"), cg = S.meta.game.current_g;
+  // One y band per lane head and per interval track; point rows get a single band.
+  const bands = [{ key: "ages", head: true, label: "Ages" }];
+  const items = [];
   for (const lane of lanes) {
-    rows.push({ laneHead: lane, y0: y, y1: y + 22 });
-    y += 22;
-    for (const r of lane.rows) {
-      const ht = r.hasIntervals ? r.tracks * TH + 4 : 18;
-      rows.push({ row: r, y0: y, y1: y + ht });
-      y += ht;
-    }
-    y += 4;
-  }
-  const H = y + 6;
-  const clipId = "tlclip" + Math.random().toString(36).slice(2, 7);
-  const svg = s("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Timeline of the game" });
-  svg.append(s("defs", {}, s("clipPath", { id: clipId }, s("rect", { x: LW, y: 0, width: PW, height: H }))));
-  const plot = s("g", { "clip-path": `url(#${clipId})` });
-  // axis
-  const ax = s("g", { class: "ax" });
-  for (const t of gTicks(x0, x1, PW)) {
-    ax.append(s("line", { class: "gridl", x1: x(t.g), x2: x(t.g), y1: AXIS - 4, y2: H }), s("text", { x: x(t.g), y: AXIS - 8, "text-anchor": "middle" }, t.label));
-  }
-  plot.append(ax);
-  // ages band + boundaries
-  for (const a of S.meta.ages) {
-    const a0 = Math.max(x0, a.g_offset + 1), a1 = Math.min(x1, a.current ? cg : a.end_g);
-    if (a1 < a0) continue;
-    const bx = x(a0 - 0.5), bw = x(a1 + 0.5) - bx;
-    plot.append(s("rect", { class: "band", x: bx + 1, y: AXIS, width: Math.max(0, bw - 2), height: 20, rx: 4 }));
-    const lab = `${ageName(a.age)}${a.current ? ` · T${cg - a.g_offset}/${a.turns_max}` : ` · ${a.turns} turns`}`;
-    if (textW(lab, 11, 600) + 12 < bw) plot.append(s("text", { class: "bandlab", x: bx + 8, y: AXIS + 14 }, lab));
-    if (a.g_offset + 0.5 > x0) plot.append(s("line", { class: "agel", x1: x(a.g_offset + 0.5), x2: x(a.g_offset + 0.5), y1: AXIS, y2: H }));
-  }
-  if (cg >= x0 && cg <= x1) plot.append(s("line", { class: "now", x1: x(cg + 0.5), x2: x(cg + 0.5), y1: AXIS - 2, y2: H }));
-  const labels = s("g", {});
-  labels.append(s("text", { class: "lane-lab", x: 4, y: AXIS + 14 }, "Ages"));
-  for (const r of rows) {
-    if (r.laneHead) {
-      labels.append(s("text", { class: "lane-lab", x: 4, y: r.y0 + 15 }, r.laneHead.label));
-      svg.append(s("line", { class: "sep", x1: 0, x2: W, y1: r.y0 + 0.5, y2: r.y0 + 0.5 }));
-      continue;
-    }
-    const row = r.row, mid = (r.y0 + r.y1) / 2;
-    let lab = row.label, lx = 14;
-    if (row.sw != null) { labels.append(s("rect", { x: 14, y: mid - 4, width: 8, height: 8, rx: 2, fill: pcolor(row.sw) })); lx = 27; }
-    while (textW(lab) > LW - lx - 8 && lab.length > 4) lab = lab.slice(0, -2);
-    if (lab !== row.label) lab = lab.slice(0, -1) + "…";
-    labels.append(s("text", { class: "row-lab", x: lx, y: mid + 4 }, s("title", {}, row.label), lab));
-    for (const it of row.items) {
-      if (it.x1 < x0 - 1 || it.x0 > x1 + 1) continue;
-      it._y = r.y0;
-      if (it.interval) {
-        const ty = r.y0 + 2 + it.track * TH, bx = x(it.x0 - 0.5), bw = Math.max(2, x(it.x1 + 0.5) - bx - 1);
-        plot.append(s("rect", { x: bx, y: ty, width: bw, height: TH - 2, rx: 3, fill: it.color, "fill-opacity": it.e.end_g == null || it.e.detail?.end_reason ? 0.22 : 0.3 }),
-          s("rect", { x: bx, y: ty, width: Math.min(3, bw), height: TH - 2, rx: 1, fill: it.color }));
-        const lab = barLabel(it.e);
-        if (textW(lab, 10) + 10 < bw) plot.append(s("text", { class: "barlab", x: bx + 6, y: ty + TH - 5 }, lab));
-      } else {
-        const px = x(it.x0);
-        if (it.shape === "tick") plot.append(s("line", { x1: px, x2: px, y1: r.y0 + 3, y2: r.y1 - 3, stroke: it.color, "stroke-width": 1.5, "stroke-opacity": 0.7 }));
-        else if (it.shape === "tri") plot.append(s("path", { d: `M${px},${mid - 6}L${px + 6},${mid + 5}L${px - 6},${mid + 5}Z`, fill: it.color, stroke: "var(--surface)", "stroke-width": 1.5 }));
-        else if (it.shape === "diamond") plot.append(s("path", { d: `M${px},${mid - 6}L${px + 6},${mid}L${px},${mid + 6}L${px - 6},${mid}Z`, fill: it.hollow ? "var(--surface)" : it.color, stroke: it.hollow ? it.color : "var(--surface)", "stroke-width": 1.5 }));
-        else plot.append(s("circle", { cx: px, cy: mid, r: 4, fill: it.hollow ? "var(--surface)" : it.color, stroke: it.hollow ? it.color : "var(--surface)", "stroke-width": it.hollow ? 1.5 : 2 }));
+    bands.push({ key: "L:" + lane.key, head: true, label: lane.label });
+    for (const row of lane.rows) {
+      const n = row.hasIntervals ? row.tracks : 1, base = `R:${lane.key}:${row.id}:`;
+      for (let k = 0; k < n; k++) bands.push({ key: base + k, row, label: k ? "" : row.label, sw: k ? null : row.sw });
+      for (const it of row.items) {
+        if (it.x1 < x0 - 1 || it.x0 > x1 + 1) continue;
+        items.push(Object.assign(it, { key: base + (it.interval ? it.track : 0), row }));
       }
     }
   }
-  if (!lanes.length) labels.append(s("text", { class: "row-lab", x: LW + 10, y: AXIS + 50 }, "No events in the selected lanes."));
-  const brush = s("rect", { class: "brush", x: 0, y: AXIS, width: 0, height: H - AXIS, style: "display:none" });
-  const cross = s("line", { class: "cross", x1: 0, x2: 0, y1: AXIS - 4, y2: H, style: "display:none" });
-  svg.append(plot, labels, cross, brush);
+  const H = bands.length * TH + 30;
+  const ages = S.meta.ages.map(a => ({ a0: Math.max(x0, a.g_offset + 1), a1: Math.min(x1, a.current ? cg : a.end_g),
+    label: `${ageName(a.age)}${a.current ? ` · T${cg - a.g_offset}/${a.turns_max}` : ` · ${a.turns} turns`}` })).filter(a => a.a1 >= a.a0);
+  const ivs = items.filter(it => it.interval), pts = items.filter(it => !it.interval);
+  const fit = (lab, turns, width) => textW(lab, 10) + 12 < turns * (width - ML - 12) / (x1 - x0 + 1);
+  const trim = lab => lab.length > 26 ? lab.slice(0, 25) + "…" : lab;
+  let state = null;  // scales and svg of the current render, for pointer handling
+  fcChart(box, t => {
+    const W = box.clientWidth || 900, paper = cssVar("--fc-color-surface-raised");
+    const shape = sym => ({ fill: it => it.hollow ? paper : pcolorT(it.pid, t), stroke: it => it.hollow ? pcolorT(it.pid, t) : paper,
+      strokeWidth: 1.5, r: 4.5, symbol: sym });
+    return {
+      height: H, marginLeft: ML, marginRight: 12, marginTop: 26, marginBottom: 4,
+      color: { type: "identity" },
+      x: gScale(x0 - 0.5, x1 + 0.5, W - ML - 12, { axis: "top" }),
+      y: { domain: bands.map(b => b.key), axis: null, grid: false, padding: 0 },
+      marks: [
+        Plot.barX(ages, { x1: a => a.a0 - 0.5, x2: a => a.a1 + 0.5, y: () => "ages", fill: cssVar("--fc-color-surface-sunken"), insetLeft: 1, insetRight: 1, insetTop: 1, insetBottom: 1 }),
+        Plot.text(ages.filter(a => fit(a.label, a.a1 - a.a0 + 1, W)), { x: a => a.a0 - 0.5, y: () => "ages", text: "label", textAnchor: "start", dx: 6, fill: t.ink }),
+        Plot.ruleX(ageBounds(x0, x1), { stroke: t.axis }),
+        cg >= x0 && cg <= x1 ? Plot.ruleX([cg + 0.5], { stroke: t.ink, strokeDasharray: "4,3" }) : null,
+        Plot.barX(ivs, { x1: it => it.x0 - 0.5, x2: it => it.x1 + 0.5, y: "key", fill: it => pcolorT(it.pid, t),
+          fillOpacity: it => it.e.end_g == null || it.e.detail?.end_reason ? 0.22 : 0.32, insetTop: 1, insetBottom: 1, clip: true }),
+        Plot.tickX(ivs, { x: it => Math.max(x0 - 0.5, it.x0 - 0.5), y: "key", stroke: it => pcolorT(it.pid, t), strokeWidth: 3, insetTop: 1, insetBottom: 1, clip: true }),
+        Plot.text(ivs.filter(it => fit(barLabel(it.e), it.x1 - it.x0 + 1, W)), { x: it => Math.max(x0 - 0.5, it.x0 - 0.5), y: "key", text: it => barLabel(it.e),
+          textAnchor: "start", dx: 6, fontSize: 10, fill: t.ink, clip: true }),
+        Plot.tickX(pts.filter(it => it.shape === "tick"), { x: "x0", y: "key", stroke: it => pcolorT(it.pid, t), strokeWidth: 1.5, strokeOpacity: 0.7, clip: true }),
+        ...[["dot", "circle"], ["tri", "triangle"], ["diamond", "diamond2"]].map(([k, sym]) =>
+          Plot.dot(pts.filter(it => it.shape === k), { x: "x0", y: "key", ...shape(sym), clip: true })),
+        Plot.ruleY(bands.filter(b => b.head && b.key !== "ages"), { y: "key", stroke: t.grid, dy: -TH / 2 }),
+        Plot.dot(bands.filter(b => b.sw != null), { x: () => x0 - 0.5, y: "key", dx: -(ML - 14), symbol: "square", r: 3.5, fill: b => pcolorT(b.sw, t) }),
+        Plot.text(bands.filter(b => b.head), { x: () => x0 - 0.5, y: "key", dx: -(ML - 4), text: "label", textAnchor: "start", fill: t.ink, fontWeight: 600 }),
+        ...[true, false].map(sw => Plot.text(bands.filter(b => !b.head && b.label && (b.sw != null) === sw), {  // dx must be constant per mark
+          x: () => x0 - 0.5, y: "key", dx: -(ML - (sw ? 22 : 12)), text: b => trim(b.label), title: "label", textAnchor: "start", fill: t.axis })),
+        lanes.length ? null : Plot.text(["No events in the selected lanes."], { text: d => d, frameAnchor: "middle", fill: t.axis }),
+      ],
+    };
+  }, { onRender: plot => { state = { svg: plot, x: plot.scale("x"), y: plot.scale("y") }; wire(plot); } });
 
-  const hit = (evt) => {
-    const pt = svg.getBoundingClientRect(), px = (evt.clientX - pt.left) * (W / pt.width), py = (evt.clientY - pt.top) * (H / pt.height);
-    const r = rows.find(rr => rr.row && py >= rr.y0 && py < rr.y1);
-    const found = r ? r.row.items.filter(it => it._y === r.y0 && (it.interval ? px >= x(it.x0 - 0.5) - 2 && px <= x(it.x1 + 0.5) + 2
-      && (r.row.tracks === 1 || Math.floor((py - r.y0 - 2) / TH) === it.track) : Math.abs(x(it.x0) - px) <= 6)) : [];
-    return { px, py, g: Math.round(x.inv(px)), row: r?.row, found };
-  };
-  let drag = null;
-  svg.addEventListener("pointerdown", e => { const p = hit(e); if (p.px >= LW) { drag = { x: p.px, moved: false }; svg.setPointerCapture(e.pointerId); } });
-  svg.addEventListener("pointermove", e => {
-    const p = hit(e);
-    if (drag) {
-      if (Math.abs(p.px - drag.x) > 5) drag.moved = true;
-      const a = Math.max(LW, Math.min(drag.x, p.px)), b = Math.min(LW + PW, Math.max(drag.x, p.px));
-      setAttrs(brush, { x: a, width: b - a }, true);
-      brush.style.display = drag.moved ? "" : "none";
-      hideTip();
-      return;
-    }
-    if (p.px < LW || p.px > LW + PW) { cross.style.display = "none"; hideTip(); return; }
-    setAttrs(cross, { x1: x(p.g), x2: x(p.g) }, true);
-    cross.style.display = "";
-    if (!p.found.length) { showTip(e, h("div", { class: "tt" }, gLabel(p.g, true)), p.row ? h("div", { class: "sec" }, p.row.label) : null); return; }
-    const shown = p.found.slice(0, 10);
-    showTip(e, h("div", { class: "tt" }, p.row.label), shown.map(it => evTip(it.e)),
-      p.found.length > shown.length ? h("div", { class: "muted" }, `+${p.found.length - shown.length} more`) : null);
-  });
-  svg.addEventListener("pointerleave", () => { cross.style.display = "none"; hideTip(); });
-  svg.addEventListener("pointerup", e => {
-    const p = hit(e);
-    if (drag && drag.moved) {
-      const a = Math.round(x.inv(Math.min(drag.x, p.px))), b = Math.round(x.inv(Math.max(drag.x, p.px)));
+  // Pointer handling over the rendered svg: crosshair + tooltip, drag to zoom, click to open a turn.
+  function hit(evt) {
+    const { svg, x, y } = state, { px, py } = svgPoint(svg, evt);
+    const band = bands.find(b => py >= y.apply(b.key) && py < y.apply(b.key) + y.bandwidth);
+    const found = band?.row ? items.filter(it => it.key === band.key && (it.interval
+      ? px >= x.apply(it.x0 - 0.5) - 2 && px <= x.apply(it.x1 + 0.5) + 2 : Math.abs(x.apply(it.x0) - px) <= 6)) : [];
+    return { px, py, g: Math.round(x.invert(px)), row: band?.row, found };
+  }
+  function wire(svg) {
+    const W = +svg.getAttribute("width"), inPlot = px => px >= ML && px <= W - 12;
+    const cross = svgEl("line", { class: "cross", y1: 22, y2: H, style: "display:none" });
+    const brush = svgEl("rect", { class: "brush", y: 22, height: H - 22, width: 0, style: "display:none" });
+    svg.append(cross, brush);
+    let drag = null;
+    svg.addEventListener("pointerdown", e => { const p = hit(e); if (inPlot(p.px)) { drag = { x: p.px, moved: false }; svg.setPointerCapture(e.pointerId); } });
+    svg.addEventListener("pointermove", e => {
+      const p = hit(e);
+      if (drag) {
+        if (Math.abs(p.px - drag.x) > 5) drag.moved = true;
+        const a = Math.max(ML, Math.min(drag.x, p.px)), b = Math.min(W - 12, Math.max(drag.x, p.px));
+        setAttrs(brush, { x: a, width: b - a }, true);
+        brush.style.display = drag.moved ? "" : "none";
+        hideTip();
+        return;
+      }
+      if (!inPlot(p.px)) { cross.style.display = "none"; hideTip(); return; }
+      const cx = state.x.apply(p.g);
+      setAttrs(cross, { x1: cx, x2: cx }, true);
+      cross.style.display = "";
+      if (!p.found.length) { showTip(e, h("div", { class: "tt" }, gLabel(p.g, true)), p.row ? h("div", { class: "sec" }, p.row.label) : null); return; }
+      const shown = p.found.slice(0, 10);
+      showTip(e, h("div", { class: "tt" }, p.row.label), shown.map(it => evTip(it.e)),
+        p.found.length > shown.length ? h("div", { class: "muted" }, `+${p.found.length - shown.length} more`) : null);
+    });
+    svg.addEventListener("pointerleave", () => { cross.style.display = "none"; hideTip(); });
+    svg.addEventListener("pointerup", e => {
+      const p = hit(e);
+      if (drag && drag.moved) {
+        const a = Math.round(state.x.invert(Math.min(drag.x, p.px))), b = Math.round(state.x.invert(Math.max(drag.x, p.px)));
+        drag = null;
+        if (b - a >= 2) { S.tl.domain = [Math.max(1, a), Math.min(cg, b)]; refresh(); }
+        return;
+      }
       drag = null;
-      if (b - a >= 2) { S.tl.domain = [Math.max(1, a), Math.min(cg, b)]; refresh(); }
-      return;
-    }
-    drag = null;
-    if (p.px >= LW) go(`#turn/${p.found.length ? p.found[0].e.start_g : p.g}`);
-  });
-  box.replaceChildren(svg);
+      if (inPlot(p.px)) go(`#turn/${p.found.length ? p.found[0].e.start_g : p.g}`);
+    });
+  }
 }
 
 function barLabel(e) {  // war/alliance subjects are "war 0-8"; name the other side instead
@@ -767,17 +888,13 @@ function evTip(e) {
   return h("div", { class: "ev" }, h("b", {}, barLabel(e)), h("div", {}, bits.filter(Boolean).join(" · ")));
 }
 
-let _resizeFn = null, _resizeT = null;
-function onResize(fn) { _resizeFn = fn; }
-window.addEventListener("resize", () => { clearTimeout(_resizeT); _resizeT = setTimeout(() => { if (_resizeFn && document.body.contains($("#view").firstChild)) _resizeFn(); }, 150); });
-
 // ------------------------------------------------------------------ charts
 async function viewCharts() {
   const c = S.chart, cat = S.meta.catalog || [];
   const d = await api(`/api/metrics?metric=${encodeURIComponent(c.metric)}&vis=${c.vis}`);
   const groups = {};
   for (const m of cat) (groups[m.victory || "other"] = groups[m.victory || "other"] || []).push(m);
-  const sel = h("select", { onchange: ev => { c.metric = ev.target.value; refresh(); } },
+  const sel = h("select", { class: "fc-input", onchange: ev => { c.metric = ev.target.value; refresh(); } },
     Object.entries(groups).map(([gname, ms]) => h("optgroup", { label: gname[0].toUpperCase() + gname.slice(1) },
       ms.map(m => h("option", { value: m.metric, selected: m.metric === c.metric }, m.label)))));
   const players = Object.values(S.players);
@@ -785,32 +902,30 @@ async function viewCharts() {
     .filter(sr => sr.points.length);
   const hiddenOmni = Object.values(d.omniscient_hidden || {}).reduce((a, b) => a + b, 0);
   const legend = h("div", { class: "legend" }, series.map(sr => h("button", {
-    class: c.hidden.has(sr.id) ? "off" : "", title: "Click to hide/show; double-click to isolate",
+    class: c.hidden.has(sr.id) ? "fc-chip off" : "fc-chip", title: "Click to hide/show; double-click to isolate",
     onclick: () => { c.hidden.has(sr.id) ? c.hidden.delete(sr.id) : c.hidden.add(sr.id); refresh(); },
     ondblclick: () => { c.hidden = new Set(series.map(x => x.id).filter(id => id !== sr.id)); refresh(); },
   }, lineKey(sr.color), sr.name)),
-    h("button", { onclick: () => { c.hidden = new Set(); refresh(); } }, "Show all"),
-    h("button", { onclick: () => { c.hidden = new Set(series.map(x => x.id).filter(id => id !== S.local)); refresh(); } }, "Only you"));
+    h("button", { class: "fc-chip", onclick: () => { c.hidden = new Set(); refresh(); } }, "Show all"),
+    h("button", { class: "fc-chip", onclick: () => { c.hidden = new Set(series.map(x => x.id).filter(id => id !== S.local)); refresh(); } }, "Only you"));
   const box = h("div", { class: "chart" });
   const shown = series.filter(sr => !c.hidden.has(sr.id));
-  const draw = () => lineChart(box, shown, xDomainFor(c.range), d.catalog);
-  requestAnimationFrame(draw);
-  onResize(draw);
+  lineChart(box, shown, xDomainFor(c.range), d.catalog);
   const table = c.table ? metricTable(shown) : null;
   return h("div", {},
     h("div", { class: "controls" }, sel,
       h("div", { class: "seg", title: "Omniscient values come from game logs and cover rivals you could not see" },
-        [["visible", "As seen on screen"], ["all", "Include omniscient"]].map(([k, l]) => h("button", { class: c.vis === k ? "on" : "", onclick: () => { c.vis = k; refresh(); } }, l))),
+        [["visible", "As seen on screen"], ["all", "Include omniscient"]].map(([k, l]) => h("button", { class: c.vis === k ? "fc-chip fc-chip-selected" : "fc-chip", onclick: () => { c.vis = k; refresh(); } }, l))),
       h("div", { class: "seg" }, [["all", "Whole game"], ...S.meta.ages.map(a => [a.age, ageName(a.age)])].map(([k, l]) =>
-        h("button", { class: c.range === k ? "on" : "", onclick: () => { c.range = k; refresh(); } }, l))),
+        h("button", { class: c.range === k ? "fc-chip fc-chip-selected" : "fc-chip", onclick: () => { c.range = k; refresh(); } }, l))),
       h("span", { class: "sp" }),
-      h("button", { class: "iconbtn", onclick: () => { c.table = !c.table; refresh(); } }, c.table ? "Hide table" : "Show table")),
+      h("button", { class: "fc-btn fc-btn-secondary iconbtn", onclick: () => { c.table = !c.table; refresh(); } }, c.table ? "Hide table" : "Show table")),
     card({},
       h("div", { class: "cardhead" }, h("h2", {}, d.catalog?.label || c.metric), h("span", { class: "sec small" }, d.catalog?.unit ? `(${d.catalog.unit.replace("_", " ")})` : ""),
         h("span", { class: "sp" }), c.vis === "visible" && hiddenOmni ? h("span", { class: "hint" }, `${hiddenOmni.toLocaleString()} omniscient rival values hidden`) : null),
       d.catalog?.description ? h("div", { class: "small sec", style: "margin:-6px 0 6px" }, d.catalog.description) : null,
-      series.length > 1 ? legend : null, box,
-      h("div", { class: "hint", style: "margin-top:6px" }, "One color per player for the whole game. Click the chart to open that turn.")),
+      series.length > 1 ? legend : null,
+      figure(box, `${d.catalog?.label || c.metric} by player. One colour per player for the whole game; click the chart to open that turn.`)),
     table ? card({ style: "margin-top:14px" }, table) : null);
 }
 
@@ -822,81 +937,68 @@ function bisect(points, g) {  // nearest index by g
 }
 
 function lineChart(box, series, [x0, x1], catalog) {
-  const W = Math.max(480, box.clientWidth), H = 340, M = { l: 56, r: 16, t: 26, b: 30 };
-  let pts = series.map(sr => ({ ...sr, points: sr.points.filter(p => p[0] >= x0 && p[0] <= x1) })).filter(sr => sr.points.length);
+  const pts = series.map(sr => ({ ...sr, points: sr.points.filter(p => p[0] >= x0 && p[0] <= x1) })).filter(sr => sr.points.length);
   if (S.chart.range === "all" && pts.length) x0 = Math.max(x0, Math.min(...pts.map(sr => sr.points[0][0])) - 1);  // skip turns with no data
   if (!pts.length) { box.replaceChildren(empty("No values for this metric in the selected range", S.chart.vis === "visible" ? " — try \"Include omniscient\"." : ".")); return; }
-  const ys = pts.flatMap(sr => sr.points.map(p => p[1]));
-  let lo = Math.min(0, ...ys), hi = Math.max(...ys);
-  if (hi === lo) hi = lo + 1;
-  const yt = niceTicks(lo, hi, 5);
-  lo = Math.min(lo, yt[0]); hi = Math.max(hi, yt[yt.length - 1]);
-  const x = linear(x0, x1, M.l, W - M.r), y = linear(lo, hi, H - M.b, M.t);
-  const svg = s("svg", { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": `${catalog?.label || "metric"} by player` });
-  const ax = s("g", { class: "ax" });
-  for (const v of yt) ax.append(s("line", { class: "gridl", x1: M.l, x2: W - M.r, y1: y(v), y2: y(v) }), s("text", { x: M.l - 8, y: y(v) + 4, "text-anchor": "end" }, fmt(v)));
-  ax.append(s("line", { x1: M.l, x2: W - M.r, y1: y(lo), y2: y(lo) }));
-  for (const t of gTicks(x0, x1, W - M.l - M.r)) ax.append(s("text", { x: x(t.g), y: H - M.b + 16, "text-anchor": "middle" }, t.label));
-  svg.append(ax);
-  for (const a of S.meta.ages) {
-    const bx = a.g_offset + 0.5;
-    if (bx > x0 && bx < x1) svg.append(s("line", { class: "agel", x1: x(bx), x2: x(bx), y1: M.t - 14, y2: H - M.b }));
-    const lx = Math.max(x0, a.g_offset + 1);
-    if (lx <= x1 && (a.current ? S.meta.game.current_g : a.end_g) >= x0) svg.append(s("text", { class: "agelab", x: x(lx) + 4, y: M.t - 6 }, ageName(a.age)));
-  }
-  // lines: break where turns are missing (gap > 3) so unobserved stretches are not interpolated
-  const order = pts.slice().sort((a, b) => (a.id === S.local) - (b.id === S.local));  // local player drawn on top
-  for (const sr of order) {
-    let d = "", prev = null;
-    for (const p of sr.points) {
-      d += `${prev == null || p[0] - prev > 3 ? "M" : "L"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`;
-      prev = p[0];
-    }
-    svg.append(s("path", { d, fill: "none", stroke: sr.color, "stroke-width": sr.id === S.local ? 2.5 : 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
-    sr.points.forEach((p, i) => {  // isolated points would otherwise be invisible
-      const isolated = (i === 0 || p[0] - sr.points[i - 1][0] > 3) && (i === sr.points.length - 1 || sr.points[i + 1][0] - p[0] > 3);
-      if (isolated) svg.append(s("circle", { cx: x(p[0]), cy: y(p[1]), r: 2.5, fill: sr.color }));
+  // Lines break where turns are missing (gap > 3) so unobserved stretches are not interpolated: a NaN row splits the line.
+  const rows = [], isolated = [];
+  for (const sr of pts) {
+    sr.points.forEach((p, i) => {
+      const gapBefore = i === 0 || p[0] - sr.points[i - 1][0] > 3, gapAfter = i === sr.points.length - 1 || sr.points[i + 1][0] - p[0] > 3;
+      if (i && gapBefore) rows.push({ id: sr.id, g: p[0] - 0.5, v: NaN });
+      rows.push({ id: sr.id, g: p[0], v: p[1] });
+      if (gapBefore && gapAfter) isolated.push({ id: sr.id, g: p[0], v: p[1] });  // a lone point would otherwise be invisible
     });
   }
-  // end label for the local player only (labels for every line would collide)
-  const mine = pts.find(sr => sr.id === S.local);
-  if (mine) {
-    const p = mine.points[mine.points.length - 1];
-    if (p[0] >= x1 - 2) svg.append(s("circle", { cx: x(p[0]), cy: y(p[1]), r: 4, fill: mine.color, stroke: "var(--surface)", "stroke-width": 2 }));
-  }
-  const cross = s("line", { class: "cross", y1: M.t, y2: H - M.b, style: "display:none" });
-  const dots = s("g", { style: "pointer-events:none" });
-  const overlay = s("rect", { x: M.l, y: M.t, width: W - M.l - M.r, height: H - M.t - M.b, fill: "transparent", style: "cursor:crosshair" });
-  svg.append(cross, dots, overlay);
-  const at = evt => {
-    const r = svg.getBoundingClientRect();
-    return Math.round(x.inv((evt.clientX - r.left) * (W / r.width)));
-  };
-  overlay.addEventListener("pointermove", evt => {
-    const g = Math.max(x0, Math.min(x1, at(evt)));
-    const rows = [];
-    dots.replaceChildren();
-    for (const sr of pts) {
-      const p = sr.points[bisect(sr.points, g)];
-      if (!p || Math.abs(p[0] - g) > 2) continue;
-      rows.push({ sr, p });
-      dots.append(s("circle", { cx: x(p[0]), cy: y(p[1]), r: 4, fill: sr.color, stroke: "var(--surface)", "stroke-width": 2 }));
-    }
-    setAttrs(cross, { x1: x(g), x2: x(g) }, true);
-    cross.style.display = "";
-    rows.sort((a, b) => b.p[1] - a.p[1]);
-    showTip(evt, h("div", { class: "tt" }, gLabel(g, true)), rows.length ? rows.map(({ sr, p }) => h("div", { class: "tr" }, lineKey(sr.color), h("b", {}, fmt(p[1])),
-      h("span", {}, sr.name, p[0] !== g ? ` (${gLabel(p[0])})` : "", p[2] === "o" ? " · omniscient" : ""))) : h("div", { class: "muted" }, "no values this turn"));
-  });
-  overlay.addEventListener("pointerleave", () => { cross.style.display = "none"; dots.replaceChildren(); hideTip(); });
-  overlay.addEventListener("click", evt => go(`#turn/${Math.max(x0, Math.min(x1, at(evt)))}`));
-  box.replaceChildren(svg);
+  const real = rows.filter(r => !Number.isNaN(r.v)), mine = pts.find(sr => sr.id === S.local);
+  const last = mine && mine.points[mine.points.length - 1][0] >= x1 - 2 ? [mine.points[mine.points.length - 1]] : [];
+  // Captured on the container so the position is known before Plot's own pointer handler fires "input".
+  let lastEvt = null;
+  box.addEventListener("pointermove", e => { lastEvt = e; }, true);
+  fcChart(box, t => {
+    const paper = cssVar("--fc-color-surface-raised"), line = (data, w) => Plot.lineY(data, { x: "g", y: "v", z: "id", stroke: r => pcolorT(r.id, t), strokeWidth: w });
+    return {
+      height: 340, marginLeft: 56, marginRight: 16, marginTop: 26, marginBottom: 30,
+      color: { type: "identity" },
+      x: gScale(x0, x1, (box.clientWidth || 900) - 72),
+      y: { label: null, zero: true, nice: true, tickFormat: fmt },
+      marks: [
+        Plot.ruleY([0], { stroke: t.axis }),
+        Plot.ruleX(ageBounds(x0, x1), { stroke: t.axis }),
+        Plot.text(ageStarts(x0, x1), { x: "g", text: "label", frameAnchor: "top", textAnchor: "start", dx: 4, dy: -18, fill: t.ink, fontWeight: 600 }),
+        line(rows.filter(r => r.id !== S.local), 1.5), line(rows.filter(r => r.id === S.local), 2.5),  // the local player is drawn on top
+        Plot.dot(isolated, { x: "g", y: "v", r: 2.5, fill: r => pcolorT(r.id, t) }),
+        Plot.dot(last, { x: p => p[0], y: p => p[1], r: 4, fill: pcolorT(S.local, t), stroke: paper, strokeWidth: 2 }),
+        Plot.ruleX(real, Plot.pointerX({ x: "g", stroke: t.axis })),
+      ],
+    };
+  }, { onRender: (plot, t) => {
+    // Plot's pointer picks the nearest turn; the tooltip and dots then list every player at that turn.
+    const dots = svgEl("g", { style: "pointer-events:none" });
+    plot.append(dots);
+    plot.addEventListener("pointerleave", () => { dots.replaceChildren(); hideTip(); });
+    plot.addEventListener("input", () => {
+      dots.replaceChildren();
+      if (!plot.value || !lastEvt) { hideTip(); return; }
+      const g = plot.value.g, xs = plot.scale("x"), ys = plot.scale("y"), paper = cssVar("--fc-color-surface-raised"), at = [];
+      for (const sr of pts) {
+        const p = sr.points[bisect(sr.points, g)];
+        if (!p || Math.abs(p[0] - g) > 2) continue;
+        at.push({ sr, p });
+        dots.append(svgEl("circle", { cx: xs.apply(p[0]), cy: ys.apply(p[1]), r: 4, fill: pcolorT(sr.id, t), stroke: paper, "stroke-width": 2 }));
+      }
+      at.sort((a, b) => b.p[1] - a.p[1]);
+      showTip(lastEvt, h("div", { class: "tt" }, gLabel(g, true)), at.length ? at.map(({ sr, p }) => h("div", { class: "tr" }, lineKey(sr.color), h("b", {}, fmt(p[1])),
+        h("span", {}, sr.name, p[0] !== g ? ` (${gLabel(p[0])})` : "", p[2] === "o" ? " · omniscient" : ""))) : h("div", { class: "muted" }, "no values this turn"));
+    });
+    plot.addEventListener("click", () => plot.value && go(`#turn/${plot.value.g}`));
+  } });
 }
 
 function metricTable(series) {
   const gs = [...new Set(series.flatMap(sr => sr.points.map(p => p[0])))].sort((a, b) => b - a);
   const idx = series.map(sr => new Map(sr.points.map(p => [p[0], p])));
-  return h("div", { class: "scroll" }, h("table", { class: "t" },
+  return h("div", { class: "scroll" }, h("table", { class: "fc-table" },
     h("tr", {}, h("th", {}, "Turn"), series.map(sr => h("th", { class: "n" }, h("span", { class: "row", style: "justify-content:flex-end;gap:5px" }, lineKey(sr.color), pname(sr.id, true))))),
     gs.map(g => h("tr", {}, h("td", {}, h("a", { href: `#turn/${g}` }, gLabel(g))), idx.map(m => {
       const p = m.get(g);
@@ -913,11 +1015,11 @@ async function viewTurn() {
     oninput: ev => { lab.textContent = gLabel(+ev.target.value, true); }, onchange: ev => setG(+ev.target.value) });
   const lab = h("span", { class: "turnlabel" }, gLabel(t.g, true));
   const nav = card({}, h("div", { class: "turnnav" },
-    h("button", { class: "iconbtn", onclick: () => setG(t.g - 1), title: "Previous turn" }, "◀"), lab,
-    h("button", { class: "iconbtn", onclick: () => setG(t.g + 1), title: "Next turn" }, "▶"), slider,
-    h("button", { class: "iconbtn", disabled: t.prev_observed == null, onclick: () => setG(t.prev_observed) }, "◀ snapshot"),
-    h("button", { class: "iconbtn", disabled: t.next_observed == null, onclick: () => setG(t.next_observed) }, "snapshot ▶"),
-    h("button", { class: "iconbtn", onclick: () => setG(cg) }, "Latest")),
+    h("button", { class: "fc-btn fc-btn-secondary iconbtn", onclick: () => setG(t.g - 1), title: "Previous turn" }, "◀"), lab,
+    h("button", { class: "fc-btn fc-btn-secondary iconbtn", onclick: () => setG(t.g + 1), title: "Next turn" }, "▶"), slider,
+    h("button", { class: "fc-btn fc-btn-secondary iconbtn", disabled: t.prev_observed == null, onclick: () => setG(t.prev_observed) }, "◀ snapshot"),
+    h("button", { class: "fc-btn fc-btn-secondary iconbtn", disabled: t.next_observed == null, onclick: () => setG(t.next_observed) }, "snapshot ▶"),
+    h("button", { class: "fc-btn fc-btn-secondary iconbtn", onclick: () => setG(cg) }, "Latest")),
     h("div", { class: "small sec", style: "margin-top:6px" }, t.observed ? `Live snapshot captured ${new Date(t.captured_at).toLocaleString()}`
       : t.summary_g ? `No live snapshot this turn; empire summary below is from ${gLabel(t.summary_g)}.` : "No live snapshot at or before this turn; only logs and captures."));
 
@@ -928,12 +1030,12 @@ async function viewTurn() {
   const evRowEl = e => h("li", {}, h("div", { class: "row", style: "gap:6px" }, h("span", { class: "kind" }, (e.phase === "end" ? "ended · " : "") + (KIND_LABEL[e.kind] || e.kind)),
     h("b", {}, e.subject), e.players.slice(0, 3).map(p => h("span", { class: "row small sec", style: "gap:4px" }, swatch(p), pname(p, true)))), evDetail(e));
   const events = card({}, h("div", { class: "cardhead" }, h("h2", {}, "Events"), h("span", { class: "sp" }),
-    h("div", { class: "seg" }, [["Yours", true], ["Everyone", false]].map(([l, v]) => h("button", { class: S.turn.localOnly === v ? "on" : "", onclick: () => { S.turn.localOnly = v; refresh(); } }, l)))),
+    h("div", { class: "seg" }, [["Yours", true], ["Everyone", false]].map(([l, v]) => h("button", { class: S.turn.localOnly === v ? "fc-chip fc-chip-selected" : "fc-chip", onclick: () => { S.turn.localOnly = v; refresh(); } }, l)))),
     exact.length ? h("ul", { class: "plain" }, Object.values(groups).flat().map(evRowEl)) : empty("Nothing recorded at exactly this turn."),
     fuzzy.length ? h("details", {}, h("summary", {}, `${fuzzy.length} more first seen in an end-of-age capture (exact turn unknown)`), h("ul", { class: "plain" }, fuzzy.map(evRowEl))) : null);
 
   const deltas = card({}, h("div", { class: "cardhead" }, h("h2", {}, "Your numbers"), h("span", { class: "sp" }), t.prev_g != null ? h("span", { class: "hint" }, `Δ vs ${gLabel(t.prev_g)}`) : null),
-    t.deltas.length ? h("table", { class: "t" }, h("tr", {}, h("th", {}, "Metric"), h("th", { class: "n" }, "Value"), h("th", { class: "n" }, "Change")),
+    t.deltas.length ? h("table", { class: "fc-table" }, h("tr", {}, h("th", {}, "Metric"), h("th", { class: "n" }, "Value"), h("th", { class: "n" }, "Change")),
       t.deltas.map(d => h("tr", {}, h("td", {}, d.label), h("td", { class: "n" }, fmt(d.value)), h("td", { class: "n" }, d.delta ? deltaSpan(d.delta, d.higher_is_better) : h("span", { class: "muted" }, d.prev == null ? "new" : "–")))))
       : empty("No metrics recorded for this turn."));
 
@@ -962,7 +1064,7 @@ function summaryCard(t) {
   if (!sm) return card({}, h("h2", {}, "Empire"), empty("No live snapshot covers this turn."));
   const prog = r => r ? h("div", {}, h("div", { class: "row small" }, h("b", {}, r.name), h("span", { class: "sp" }),
     h("span", { class: "sec" }, `${fmt(r.progress)} / ${fmt(r.cost)}${r.turns_left != null ? ` · ${r.turns_left} turns` : ""}`)), meter(r.cost ? r.progress / r.cost : 0)) : h("span", { class: "muted" }, "—");
-  const chips = xs => xs?.length ? h("div", { class: "tagline", style: "margin-top:0" }, xs.map(x => h("span", { class: "chip" }, x))) : h("span", { class: "muted" }, "—");
+  const chips = xs => xs?.length ? h("div", { class: "tagline", style: "margin-top:0" }, xs.map(x => h("span", { class: "fc-chip chip" }, x))) : h("span", { class: "muted" }, "—");
   const st = sm.settlements || [];
   return card({}, h("div", { class: "cardhead" }, h("h2", {}, "Empire"), h("span", { class: "sec small" }, t.summary_g !== t.g ? `as of ${gLabel(t.summary_g)}` : "")),
     h("dl", { class: "kv" },
@@ -978,7 +1080,7 @@ function summaryCard(t) {
       sm.age_progress ? [h("dt", {}, "Age progress"), h("dd", {}, `${sm.age_progress.current} / ${sm.age_progress.max}`)] : null,
       sm.notifications_unit_lost?.length ? [h("dt", {}, "Units lost"), h("dd", {}, sm.notifications_unit_lost.map(n => h("div", { class: "small" }, n)))] : null),
     st.length ? h("details", { open: true }, h("summary", {}, `${st.length} settlements · ${st.filter(x => x.type === "city").length} cities`),
-      h("table", { class: "t" }, h("tr", {}, h("th", {}, "Name"), h("th", {}, "Type"), h("th", { class: "n" }, "Pop")),
+      h("table", { class: "fc-table" }, h("tr", {}, h("th", {}, "Name"), h("th", {}, "Type"), h("th", { class: "n" }, "Pop")),
         st.slice().sort((a, b) => b.population - a.population).map(x => h("tr", {}, h("td", {}, x.name, x.capital ? " ★" : ""), h("td", { class: "sec" }, x.type), h("td", { class: "n" }, x.population))))) : null);
 }
 
@@ -989,19 +1091,20 @@ async function viewAdvisor() {
   const ap = a.advisor_profile, pp = a.player_profile;
   const histList = (rows, fmtRow) => rows.length > 1 ? h("details", {}, h("summary", {}, `${rows.length - 1} earlier version${rows.length > 2 ? "s" : ""}`),
     h("ul", { class: "plain" }, rows.slice(1).map(r => h("li", { class: "small" }, h("b", {}, `v${r.version}`), ` from ${gLabel(r.valid_from_g)} · `, fmtRow(r))))) : null;
-  const advisorCard = card({}, h("div", { class: "cardhead" }, h("h2", {}, "Advisor personality"), h("span", { class: "sp" }), ap ? h("span", { class: "chip" }, `v${ap.version} since ${gLabel(ap.valid_from_g)}`) : null),
-    ap ? h("div", {}, h("div", { class: "leader" }, pretty(ap.personality)), h("div", { class: "sec small" }, voc.personality?.[ap.personality] || ""),
+  const advisorCard = card({}, h("div", { class: "cardhead" }, h("h2", {}, "Advisor personality"), h("span", { class: "sp" }), ap ? h("span", { class: "fc-chip chip" }, `v${ap.version} since ${gLabel(ap.valid_from_g)}`) : null),
+    ap ? h("div", {}, h("div", { class: "leader" }, ap.name || pretty(ap.personality)), ap.name ? h("div", { class: "small muted" }, pretty(ap.personality)) : null, h("div", { class: "sec small" }, voc.personality?.[ap.personality] || ""),
       ap.voice ? h("p", {}, ap.voice) : null,
-      h("div", { class: "tagline" }, (ap.priorities || []).map((p, i) => h("span", { class: "chip", title: voc.advisor_priority?.[p] || "" }, h("b", {}, i + 1), " ", p.replace(/_/g, " ")))),
+      h("div", { class: "tagline" }, (ap.priorities || []).map((p, i) => h("span", { class: "fc-chip chip", title: voc.advisor_priority?.[p] || "" }, h("b", {}, i + 1), " ", p.replace(/_/g, " ")))),
       ap.quirks ? h("p", { class: "small sec" }, ap.quirks) : null,
       histList(a.advisor_history, r => `${pretty(r.personality)} (${(r.priorities || []).join(", ")})`))
-      : empty(h("b", {}, "No advisor personality yet. "), "Ask Claude to pick one — e.g. \"be a sarcastic advisor\" or \"talk like a terse general\". Options: ",
-        Object.keys(voc.personality || {}).join(", "), "."));
-  const playerCard = card({}, h("div", { class: "cardhead" }, h("h2", {}, "Your playstyle"), h("span", { class: "sp" }), pp ? h("span", { class: "chip" }, `v${pp.version} since ${gLabel(pp.valid_from_g)}`) : null),
-    pp ? h("div", {}, h("div", { class: "tagline", style: "margin-top:0" }, (pp.playstyle || []).map(p => h("span", { class: "chip", title: voc.playstyle?.[p] || "" }, h("b", {}, p)))),
+      : empty(h("b", {}, "No advisor yet. "), "Ask Claude to set up the advisor: it walks you through presets, saved profiles from earlier games, or a custom voice."));
+  const playerCard = card({}, h("div", { class: "cardhead" }, h("h2", {}, "Your playstyle"), h("span", { class: "sp" }), pp ? h("span", { class: "fc-chip chip" }, `v${pp.version} since ${gLabel(pp.valid_from_g)}`) : null),
+    pp ? h("div", {}, pp.name ? h("div", { class: "leader" }, pp.name) : null,
+      (pp.motives || []).length ? h("div", { class: "tagline", style: "margin-top:0" }, pp.motives.map(m => h("span", { class: "fc-chip chip", title: voc.motive?.[m] || "" }, m.replace(/_/g, " ")))) : null,
+      h("div", { class: "tagline" }, (pp.playstyle || []).map(p => h("span", { class: "fc-chip chip", title: voc.playstyle?.[p] || "" }, h("b", {}, p)))),
       h("div", { class: "small sec", style: "margin-top:6px" }, `Risk tolerance: ${pp.risk_tolerance}`), pp.notes ? h("p", {}, pp.notes) : null,
       histList(a.player_history, r => `${(r.playstyle || []).join(", ")} · risk ${r.risk_tolerance}`))
-      : empty(h("b", {}, "No player profile yet. "), "Tell Claude how you like to play (aggressive, builder, whimsical…) and it will weigh its advice accordingly."));
+      : empty(h("b", {}, "No player profile yet. "), "Ask Claude to set up your profile: are you here to fight, build, explore, mess around, or make a story?"));
 
   const plan = a.plan || [];
   const planEl = h("div", { class: "grid" }, a.plan_error ? h("div", { class: "error" }, "Goal evaluation failed: ", a.plan_error) : null,
@@ -1011,11 +1114,11 @@ async function viewAdvisor() {
   const shown = a.annotations.filter(n => !S.notes.kind || n.kind === S.notes.kind);
   const log = card({}, h("div", { class: "cardhead" }, h("h2", {}, "Annotations"), h("span", { class: "sp" }),
     kinds.length > 1 ? h("div", { class: "seg" }, [["", "All"], ...kinds.map(k => [k, k.replace("_", " ")])].map(([k, l]) =>
-      h("button", { class: S.notes.kind === k ? "on" : "", onclick: () => { S.notes.kind = k; refresh(); } }, l))) : null),
-    shown.length ? h("div", { class: "scroll", style: "max-height:600px" }, h("table", { class: "t" },
+      h("button", { class: S.notes.kind === k ? "fc-chip fc-chip-selected" : "fc-chip", onclick: () => { S.notes.kind = k; refresh(); } }, l))) : null),
+    shown.length ? h("div", { class: "scroll", style: "max-height:600px" }, h("table", { class: "fc-table" },
       h("tr", {}, h("th", {}, "Turn"), h("th", {}, "Kind"), h("th", {}, "Note"), h("th", {}, "About")),
       shown.map(n => h("tr", {}, h("td", { style: "white-space:nowrap" }, h("a", { href: `#turn/${n.g}` }, gLabel(n.g)), h("div", { class: "small muted" }, n.author)),
-        h("td", {}, h("span", { class: "kind" }, n.kind.replace("_", " ")), n.verdict ? h("div", { style: "margin-top:3px" }, badge(n.verdict)) : null),
+        h("td", {}, h("span", { class: "kind" }, n.kind.replace("_", " ")), n.outcome ? h("div", { style: "margin-top:3px" }, badge(n.outcome)) : null),
         h("td", { style: "white-space:pre-wrap" }, n.text),
         h("td", { class: "small sec" }, n.scope ? `${n.scope} ${n.scope === "age" ? ageName(n.scope_key) : n.scope_key}` : n.goal_id ? `goal ${n.goal_id}` : n.strategy_id ? `strategy ${n.strategy_id}` : "")))))
       : empty("No annotations yet. Claude writes them as it advises: your intentions, priority changes, its warnings and advice, and its narrative of how each phase went."));
@@ -1025,7 +1128,7 @@ async function viewAdvisor() {
 
 function strategyCard(st) {
   return card({}, h("div", { class: "cardhead" }, h("h2", {}, st.name), h("span", { class: "status" }, st.status), h("span", { class: "sp" }),
-    (st.victory_types || []).map(v => h("span", { class: "chip" }, v)),
+    (st.victory_types || []).map(v => h("span", { class: "fc-chip chip" }, v)),
     st.started_g ? h("span", { class: "small muted" }, `since ${gLabel(st.started_g)}${st.ended_g ? ` until ${gLabel(st.ended_g)}` : ""}`) : null),
     st.description ? h("p", { class: "sec", style: "margin-top:0" }, st.description) : null,
     (st.goals || []).length ? st.goals.map(goalEl) : empty("No goals under this strategy yet."));
@@ -1048,18 +1151,12 @@ function goalEl(g) {
 
 // ------------------------------------------------------------------ boot
 function initTheme() {
-  const btn = $("#theme"), order = ["", "light", "dark"];
-  const label = () => { btn.textContent = { "": "◐ System", light: "☀ Light", dark: "☾ Dark" }[document.documentElement.dataset.theme || ""]; };
+  const btn = $("#theme");
+  const label = () => btn.setAttribute("aria-checked", String(document.documentElement.dataset.theme === "dark"));
   label();
-  btn.addEventListener("click", () => {
-    const cur = document.documentElement.dataset.theme || "", next = order[(order.indexOf(cur) + 1) % order.length];
-    if (next) document.documentElement.dataset.theme = next; else delete document.documentElement.dataset.theme;
-    try { next ? localStorage.setItem("civilizer-theme", next) : localStorage.removeItem("civilizer-theme"); } catch (e) {}
-    label();
-    if (_resizeFn) _resizeFn();
-  });
+  btn.addEventListener("click", () => { fcToggleTheme(); label(); });
 }
-window.addEventListener("hashchange", () => { parseHash(); _resizeFn = null; refresh(); });
+window.addEventListener("hashchange", () => { parseHash(); refresh(); });
 initTheme();
 parseHash();
 refresh().then(poll);

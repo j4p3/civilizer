@@ -4,19 +4,30 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Civilizer</title>
+<link rel="icon" href="data:,">
+<!-- Cascade layers: the dashboard's element resets sit below Foolscap's components; unlayered dashboard rules win. -->
+<style>@layer base, components;</style>
+<link rel="stylesheet" href="/foolscap/foolscap.vars.css">
+<link rel="stylesheet" href="/foolscap/fonts.css">
+<link rel="stylesheet" href="/foolscap/foolscap.css">
 <link rel="stylesheet" href="/style.css">
-<script>try { const t = localStorage.getItem("civilizer-theme"); if (t) document.documentElement.dataset.theme = t; } catch (e) {}</script>
+<!-- Foolscap's runtime sets the paper/blueprint theme before first paint; Plot draws the figures. -->
+<script src="/foolscap/d3.min.js"></script>
+<script src="/foolscap/plot.umd.min.js"></script>
+<script src="/foolscap/foolscap-plot.js"></script>
 </head>
 <body>
 <header class="top">
   <div class="bar">
-    <span class="brand">Civilizer</span>
+    <a class="brand" href="/#home">Civilizer</a>
+    <a class="crumb" id="crumb" href="/#home" hidden>Games ›</a>
     <span class="gameline" id="gameline">Loading…</span>
     <span class="pill" id="refresh" title="Last store refresh"></span>
-    <span class="pill" id="monitor" title="Turn monitor"><span class="dot"></span>monitor</span>
-    <button class="iconbtn" id="theme" title="Theme: system / light / dark">◐</button>
+    <span class="status" id="monitor" role="img" aria-label="Turn monitor" title="Turn monitor"><span class="dot"></span></span>
+    <button class="switch" id="theme" role="switch" aria-checked="false" aria-label="Dark theme" title="Dark theme"><span class="knob"></span></button>
   </div>
-  <nav class="tabs" id="tabs">
+  <!-- one game's analyses; hidden on the Games index until a game is picked -->
+  <nav class="tabs" id="tabs" hidden>
     <a href="#overview" data-tab="overview">Overview</a>
     <a href="#story" data-tab="story">Story</a>
     <a href="#timeline" data-tab="timeline">Timeline</a>

@@ -47,11 +47,11 @@ def render(snap: dict, where: str, radius: int = 4) -> str:
             marks.setdefault((u["x"], u["y"]), "u ")
     for u in snap.get("visible_enemy_units") or []:
         marks[(u["x"], u["y"])] = "E!"
-    lines = [f"Map around {where} ({cx},{cy}), radius {radius}. Rows are offset hex rows; odd rows shifted right.",
+    lines = [f"Map around {where} ({cx},{cy}), radius {radius}. North is up (y grows northward); rows are offset hex rows, odd rows shifted right.",
              "@X your settlement, #X foreign, u your unit, E! visible enemy, ~~ ocean, ~ coast, ^^ mountain, h hill, . flat, ?? unrevealed; owner suffix: * you, digit = player id mod 10",
              ""]
     detail = []
-    for y in range(cy - radius, cy + radius + 1):
+    for y in range(cy + radius, cy - radius - 1, -1):  # game y grows northward: print north first
         row = [" " if y % 2 == 0 else "   "]
         for x in range(cx - radius, cx + radius + 1):
             p = plots.get((x, y))

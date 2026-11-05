@@ -5,7 +5,8 @@ Sources, merged per age:
     end-game summary datasets, and every major player's techs/civics/government/religion/settlements/
     wars at the captured turn. Capture each old save once to bracket events in ages without logs.
   - live snapshots (data/snapshots/<seed>/): the local player's research/civic/government per turn.
-  - archived logs (data/archive/logs/): wars, city captures, religions, unit kills, production.
+  - archived logs (data/archive/logs/): wars, city captures, religions, unit kills, production, diplomacy
+    (diplomacy.py: actions, befriending independents, suzerainties, proposal responses, meetings).
   - save headers: game metadata and per-age rosters.
 
 Output: games/<seed>/game.json (everything), events.jsonl, series_*.csv. See README "Game export".
@@ -285,7 +286,8 @@ def _diff_states(kind: str, captures_by_age: dict[str, list[dict]], key, clock: 
     return out
 
 
-def export(seed: str | None = None, out_root: Path = GAMES) -> Path:
+def export(seed: str | None = None, out_root: Path | None = None) -> Path:
+    out_root = out_root or GAMES  # resolved at call time so tests/scratch runs can redirect export.GAMES
     captures = load_captures(seed) if seed else []
     if seed is None:
         seeds = sorted((HISTORY.glob("*") if HISTORY.exists() else []), key=lambda d: max((_stamp(f) for f in d.glob("*.json")), default=""))
@@ -303,7 +305,7 @@ def export(seed: str | None = None, out_root: Path = GAMES) -> Path:
     sessions = [(d, session_segments(d, _session_last_age(d, snap_stamps))) for d in dirs if owners[d] in (seed, None)]
     L = {n: merged_logs(n, sessions) for n in
          ("Player_Stats", "DiplomacySummary", "Historian", "Game_Religion", "CityBuildQueue", "CityPurchase",
-          "Player_Legacies", "CombatLog")}
+          "Player_Legacies", "CombatLog", "Game_Gossip", "Independents", "Game_TradeManager", "Player_Treasury")}
 
     # save metadata: the save-file game matching this seed (none yet for a brand-new game)
     guid, tl = save_timeline(seed, snaps)
@@ -478,6 +480,8 @@ def export(seed: str | None = None, out_root: Path = GAMES) -> Path:
             events.append(_ev("legacy", clock.at(age, t), clock.at(age, t), [int(r["Player"])], r.get("Legacy", ""),
                               "log:Player_Legacies"))
 
+    events += _diplomacy(L, clock, players, minors, snaps, names)
+
     majors = set(players)
     for e in events:
         if any(p not in majors for p in e["players"]):
@@ -495,6 +499,9 @@ def export(seed: str | None = None, out_root: Path = GAMES) -> Path:
         series["summary"] = last.get("summary")
         series["legacy_points"] = {p["id"]: p.get("legacy_points") for p in last["players"]}
 
+    meta = _game_meta(seed, guid, head, snaps, captures)
+    combat_rewards = _combat_rewards(L, clock, players, rosters, snaps, names, meta)
+
     coverage = {
         "captures": [{"age": c["game"]["age"], "turn": c["game"]["turn"], "errors": c.get("errors") or []} for c in captures],
         "snapshots": {a: [s["game"]["turn"] for s in snaps if s["game"]["age"] == a] for a in AGES},
@@ -505,7 +512,7 @@ def export(seed: str | None = None, out_root: Path = GAMES) -> Path:
     game = {
         "schema": SCHEMA,
         "exported_at": datetime.now().isoformat(timespec="seconds"),
-        "game": _game_meta(seed, guid, head, snaps, captures),
+        "game": meta,
         "ages": [{"age": a, "turns": clock.lengths[a], "g_offset": clock.offset[a]} for a in AGES],
         "players": sorted(players.values(), key=lambda p: p["id"]),
         "minors": {a: {str(k): v for k, v in m.items()} for a, m in minors.items()},
@@ -515,6 +522,8 @@ def export(seed: str | None = None, out_root: Path = GAMES) -> Path:
         "coverage": coverage,
         "series": series,
         "events": events,
+        "combat_rewards": combat_rewards["events"],
+        "unexplained_gold": [{"age": a, "player": p, "turn": t, "value": v} for (a, p, t), v in combat_rewards["unexplained"].items()],
     }
 
     out = out_root / seed
@@ -539,6 +548,70 @@ def _game_meta(seed: str, guid: str | None, head, snaps: list[dict], captures: l
     diff = re.sub(r"^LOC_(.*)_NAME$", r"\1", g.get("difficulty") or "") or None
     return {"seed": seed, "guid": None, "leader": me.get("leader"), "civilization": me.get("civilization"), "difficulty": diff,
             "map": None, "map_size": None, "speed": None, "app_version": None, "local_player_id": local}
+
+
+def _combat_rewards(L: dict, clock: Clock, players: dict[int, dict], rosters: dict, snaps: list[dict], names: dict[str, str],
+                    meta: dict) -> dict:
+    """combat.rewards() with each player's leader / civilization per age and the local player's slotted traditions."""
+    from . import combat
+
+    try:
+        R = combat.load_rules()
+    except OSError:  # game data not installed (tests, CI): log-only events, no kill rewards
+        R = {"units": {}, "kill_rules": [], "independents": {}, "city_state_types": {}, "tradition_names": {}}
+    by_name = defaultdict(set)
+    for k, v in names.items():
+        by_name[v].add(k)
+
+    def type_of(display: str | None, prefix: str) -> str | None:
+        hits = sorted(k[4:-5] for k in by_name.get(display or "", ()) if k.startswith(f"LOC_{prefix}_") and k.endswith("_NAME"))
+        return hits[0] if hits else None
+
+    local = meta.get("local_player_id") or 0
+    trad_by_name = {names.get(loc, loc): t for t, loc in (R.get("tradition_names") or {}).items()}
+    local_trads: dict[str, list[tuple[int, set]]] = defaultdict(list)
+    notices: dict[tuple[str, int], list[dict]] = defaultdict(list)
+    for s in snaps:
+        a, t, me = s["game"]["age"], s["game"]["turn"], s.get("me") or {}
+        local_trads[a].append((t, {trad_by_name.get(n, n) for n in me.get("traditions") or []}))
+        notices[(a, t)] += [n for n in (s.get("notifications") or {}).get("items") or []
+                            if n.get("type") == "NOTIFICATION_DISPERSE_IP_REWARD"]
+
+    def contexts(pid: int, age: str, turn: int) -> dict:
+        p = players.get(pid) or {}
+        leader = p.get("leader_type") or type_of(p.get("leader"), "LEADER")
+        if pid == local and (meta.get("leader") or "").startswith("LEADER_"):
+            leader = leader or meta["leader"]
+        civ = next((r["civilization"] for r in rosters.get(age, []) if r["slot"] == pid), None) or \
+            type_of((p.get("civilizations") or {}).get(age), "CIVILIZATION")
+        trads = None
+        if pid == local and local_trads.get(age):
+            before = [ts for t, ts in local_trads[age] if t <= turn]
+            trads = before[-1] if before else local_trads[age][0][1]
+        return {"leader": leader, "civilization": civ, "traditions": trads}
+
+    name_to_id = {p["leader"]: pid for pid, p in players.items() if p.get("leader")}
+    return combat.rewards(L, clock, contexts, name_to_id, notices, R)
+
+
+def _diplomacy(L: dict, clock: Clock, players: dict[int, dict], minors: dict[str, dict[int, str]], snaps: list[dict],
+               names: dict[str, str]) -> list[dict]:
+    """diplomacy.build() with leader names for majors and city-state names from captures and snapshots."""
+    from . import diplomacy
+
+    try:
+        R = diplomacy.load_rules()
+    except OSError:  # game data not installed (tests, CI)
+        R = diplomacy.EMPTY_RULES
+    known: dict[str, dict[int, str]] = defaultdict(dict)
+    for s in snaps:
+        for c in s.get("city_states") or []:
+            if c.get("id") is not None and c.get("name"):
+                known[s["game"]["age"]][c["id"]] = c["name"]
+    for a, m in minors.items():
+        known[a].update(m)
+    majors = {pid: p.get("leader") for pid, p in players.items()}
+    return diplomacy.build(L, clock, majors, known, names, R)
 
 
 def _json_default(o):

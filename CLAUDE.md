@@ -23,6 +23,7 @@ uv run civilizer monitor          # run in background while the user plays: per-
 uv run civilizer dashboard        # web dashboard over the store, http://127.0.0.1:8777
 uv run civilizer advisor brief    # per-turn advisor briefing from the store (also via the `civilizer` MCP server)
 uv run civilizer pedia "<topic>"  # Civilopedia text; `rules` has the authoritative modifier numbers
+uv run civilizer pedia search|page|links|compare|filter|reachable ...  # indexed Civilopedia (data/civilopedia.db): facts + links
 ```
 
 ## Central store

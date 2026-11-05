@@ -164,11 +164,15 @@ def _types(files: list[Path]) -> dict[str, tuple[str | None, str | None, str | N
 
 # ---------------------------------------------------------------- index
 
-def build_index() -> dict:
-    idx = dict(rules.text_index())
-    idx.update(_extra_text(_extra_text_files()))
-    st = _structure(_structure_files())
-    types = _types(rules._data_files())
+def build_index(idx: dict[str, str] | None = None, structure_files: list[Path] | None = None,
+                data_files: list[Path] | None = None, keep_keys: bool = False) -> dict:
+    """Prose pages from the install (defaults) or from explicit inputs (civilopedia.py passes a fixture's).
+    keep_keys adds each chapter's raw text keys, so callers can re-render the markup (links) themselves."""
+    if idx is None:
+        idx = dict(rules.text_index())
+        idx.update(_extra_text(_extra_text_files()))
+    st = _structure(_structure_files() if structure_files is None else structure_files)
+    types = _types(rules._data_files() if data_files is None else data_files)
     static_by_id: dict[str, list[str]] = {}
     for sec, pid in st["pages"]:
         static_by_id.setdefault(pid, []).append(sec)
@@ -228,7 +232,8 @@ def build_index() -> dict:
                 continue
             tkeys = [c.get("title"), f"LOC_PEDIA_{section}_PAGE_CHAPTER_{ch}_TITLE", f"LOC_PEDIA_PAGE_CHAPTER_{ch}_TITLE"]
             ctitle = next((clean(idx[t], idx) for t in tkeys if t and t in idx), ch.replace("_", " ").title())
-            chs.append({"id": ch, "title": ctitle, "text": "\n\n".join(paras)})
+            chs.append({"id": ch, "title": ctitle, "text": "\n\n".join(paras)}
+                       | ({"keys": [k for _, k in sorted(c["paras"]) if k in idx]} if keep_keys else {}))
         if not chs:
             continue
         sname = st["sections"].get(section, {}).get("name")
@@ -397,7 +402,13 @@ def _print(res: dict, as_json: bool) -> None:
 
 
 def main(argv: list[str]) -> int:
-    ap = argparse.ArgumentParser(prog="civilizer pedia", description="Search the game's Civilopedia (from the install files).")
+    if argv[:1] and argv[0] in ("build", "search", "page", "links", "compare", "filter", "reachable", "info"):
+        from . import civilopedia  # indexed Civilopedia (data/civilopedia.db): search, pages, links, compare
+
+        return civilopedia.main(list(argv))
+    ap = argparse.ArgumentParser(prog="civilizer pedia", description="Search the game's Civilopedia (from the install files). "
+                                 "Subcommands build | search | page | links | compare | filter | reachable | info use the "
+                                 "indexed Civilopedia (data/civilopedia.db); see `civilizer pedia search -h`.")
     ap.add_argument("query", nargs="*", help="title, keyword or page key (SECTION:PAGE_ID); empty with --section lists pages. "
                     "`sections`, `rebuild` and `list SECTION` as the first words act like the flags")
     ap.add_argument("--section", "-s", help="limit to a section (CONCEPTS, AGES, UNITS, BUILDINGS, WONDERS, LEADERS, ...)")

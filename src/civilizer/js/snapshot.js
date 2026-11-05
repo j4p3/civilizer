@@ -415,6 +415,19 @@
     }).filter((v) => v.standings.some((r) => r.total > 1));
   });
 
+  // claimed victories: the same no-argument call as base-standard/ui/endgame/screen-endgame.js:304,
+  // endgame/model-endgame.js:72 and age-scores/model-age-scores.js:36 (the age-scores screen, reachable mid-game).
+  // Entries are {team, victory (hash), place}; a place-1 entry means that victory was won. victories.xml defines only
+  // game-ending victory types (the Modern ones, domination, score), so any winner means the game is over.
+  out.claimed_victories = sec("claimed_victories", () =>
+    Game.VictoryManager.getVictories().map((v) => ({
+      victory: GameInfo.Victories.lookup(v.victory)?.VictoryType ?? null,
+      place: v.place,
+      team: v.team,
+      players: Players.getAlive().filter((p) => p.isMajor && p.team == v.team).map((p) => p.id),
+    }))
+  );
+
   // countdown victories (GDP, Innovation, Tourism, Dominion): victories-screen-model.js / victories-screen.js
   // Verified live 2026-11-02 (Modern turn 3). On by default; pass victories:false to skip.
   if (OPT.victories !== false) out.countdown_victories = sec("countdown_victories", () =>

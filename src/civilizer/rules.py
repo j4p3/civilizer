@@ -53,6 +53,25 @@ def _data_files() -> list[Path]:
     return [p for r in (GAME / "Base" / "modules", GAME / "DLC") for p in r.rglob("data/**/*.xml")]
 
 
+def capital_names() -> dict[str, str]:
+    """Civilization display name (short and full, e.g. 'Rome' and 'Roman Empire') -> its capital's name ('Roma'),
+    from the Civilizations rows' CapitalName. Empty when the game is not installed."""
+    names, out = text_index(), {}
+    for f in _data_files():
+        if not f.name.startswith("civilizations"):
+            continue
+        try:
+            rows = ET.parse(f).getroot().iter("Row")
+        except ET.ParseError:
+            continue
+        for r in rows:
+            if (cap := names.get(r.get("CapitalName") or "")):
+                for k in ("Name", "FullName"):
+                    if (civ := names.get(r.get(k) or "")):
+                        out[civ] = cap
+    return out
+
+
 def references(type_id: str, limit: int = 40) -> list[tuple[str, str]]:
     """XML lines (and whole <Modifier> blocks) that mention type_id or its modifiers."""
     stem = re.sub(r"^(TRADITION|BUILDING|UNIT|IMPROVEMENT|WONDER|POLICY|CIVIC|TECH|NODE_\w+?)_", "", type_id)

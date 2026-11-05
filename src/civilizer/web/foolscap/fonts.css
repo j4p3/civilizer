@@ -1,0 +1,13 @@
+/* Foolscap self-hosted faces. Lora and IBM Plex Mono are latin subsets from @fontsource; Cooper BT is the licensed Bitstream face (see fonts/cooper-bt). Run scripts/copy-fonts.sh. */
+
+/* Lora — text serif */
+@font-face { font-family: "Lora"; font-style: normal; font-weight: 400; font-display: swap; src: url("fonts/lora-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "Lora"; font-style: italic; font-weight: 400; font-display: swap; src: url("fonts/lora-latin-400-italic.woff2") format("woff2"); }
+@font-face { font-family: "Lora"; font-style: normal; font-weight: 500; font-display: swap; src: url("fonts/lora-latin-500-normal.woff2") format("woff2"); }
+@font-face { font-family: "Lora"; font-style: normal; font-weight: 600; font-display: swap; src: url("fonts/lora-latin-600-normal.woff2") format("woff2"); }
+@font-face { font-family: "Lora"; font-style: italic; font-weight: 600; font-display: swap; src: url("fonts/lora-latin-600-italic.woff2") format("woff2"); }
+@font-face { font-family: "Lora"; font-style: normal; font-weight: 700; font-display: swap; src: url("fonts/lora-latin-700-normal.woff2") format("woff2"); }
+
+/* Cooper BT Medium — display slab. One weight; declared across 500–800 so bold/black utilities use the real face instead of synthesizing. */
+@font-face { font-family: "Cooper BT"; font-style: normal; font-weight: 500 800; font-display: swap; src: url("fonts/CooperMdBT-Regular.woff2") format("woff2"); }
+@font-face { font-family: "Cooper BT"; font-style: italic; font-weight: 500 800; font-display: swap; src: url("fonts/CooperMdBT-Italic.woff2") format("woff2"); }

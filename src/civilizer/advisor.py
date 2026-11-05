@@ -12,10 +12,11 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from . import store
+from . import presets, store
 
 STATUSES = ("active", "achieved", "failed", "abandoned")
-STATUS_VERDICT = {"achieved": "went_well", "failed": "went_awry", "abandoned": "mixed"}
+# default outcome when a goal/strategy resolves without one: dropping a plan is a change of plans, not a failure
+STATUS_OUTCOME = {"achieved": "success", "failed": "failure", "abandoned": "changed_plans"}
 SCOPES = ("game", "age", "war", "goal")
 
 
@@ -54,6 +55,17 @@ def _check(con, field: str, values) -> None:
     for v in [values] if isinstance(values, str) else values or []:
         if v not in allowed:
             raise AdvisorError(f"unknown {field} {v!r}; one of: {', '.join(allowed)}")
+
+
+def _outcome(outcome: str | None) -> str | None:
+    """Validate an outcome; the pre-v8 verdict names (went_well, went_awry, mixed) are accepted as aliases."""
+    if not outcome:
+        return None
+    outcome = store.OUTCOME_ALIASES.get(outcome, outcome)
+    if outcome not in store.VOCAB["outcome"]:  # the code's list: an older process may have reseeded the vocab table
+        raise AdvisorError(f"unknown outcome {outcome!r}; one of: {', '.join(store.VOCAB['outcome'])} "
+                           f"(or old verdicts {', '.join(store.OUTCOME_ALIASES)})")
+    return outcome
 
 
 def _goal(con, game: str, goal_id: int) -> sqlite3.Row:
@@ -123,14 +135,13 @@ def _check_scope(con, game: str, scope: str, scope_key: str | None) -> str:
     return str(scope_key)
 
 
-def annotate(con, game: str, text: str, kind: str = "observation", author: str = "advisor", verdict: str | None = None,
+def annotate(con, game: str, text: str, kind: str = "observation", author: str = "advisor", outcome: str | None = None,
              goal_id: int | None = None, strategy_id: int | None = None, event_key: str | None = None, g: int | None = None,
              scope: str | None = None, scope_key: str | None = None) -> int:
     """Record a non-game note. scope/scope_key tie it to a phase (game / AGE_* / war event_key / goal id): narrative
-    and outcome notes there are the phase's story, and an outcome verdict overrides the phase's heuristic verdict."""
+    and outcome notes there are the phase's story, and an outcome note's outcome overrides the phase's heuristic one."""
     _check(con, "annotation_kind", kind)
-    if verdict:
-        _check(con, "verdict", verdict)
+    outcome = _outcome(outcome)
     if author not in ("advisor", "player"):
         raise AdvisorError("author must be advisor or player")
     if not text or not text.strip():
@@ -150,7 +161,7 @@ def annotate(con, game: str, text: str, kind: str = "observation", author: str =
     age, turn = _at(con, game, g)
     aid = _next_id(con, "annotations", "annotation_id", game)
     con.execute("INSERT INTO annotations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (game, aid, g, age, turn, author, kind, text.strip(), verdict, goal_id, strategy_id, event_key, scope, scope_key,
+                (game, aid, g, age, turn, author, kind, text.strip(), outcome, goal_id, strategy_id, event_key, scope, scope_key,
                  store.now()))
     return aid
 
@@ -171,58 +182,186 @@ def annotations(con, game: str, kind: str | None = None, scope: str | None = Non
 
 # ---------------------------------------------------------------- profiles
 
+def _advisor_preset(con, personality: str) -> dict:
+    p = presets.advisor(personality)
+    if not p:
+        raise AdvisorError(f"unknown advisor preset {personality!r}; one of: {', '.join(presets.advisors())} "
+                           "(or create_advisor_preset for a custom one)")
+    return p
+
+
+ROLES = {"advisor": ("advisor_profiles", ("personality", "voice", "priorities", "quirks")),
+         "player": ("player_profiles", ("motives", "playstyle", "risk_tolerance", "notes"))}
+_JSON_COLS = ("priorities", "playstyle", "motives")
+
+
+def _role(role: str) -> tuple[str, tuple[str, ...]]:
+    if role not in ROLES:
+        raise AdvisorError("role must be advisor or player")
+    return ROLES[role]
+
+
+def _decode(r) -> dict:
+    d = dict(r)
+    for k in _JSON_COLS:
+        if k in d:
+            d[k] = json.loads(d[k] or "[]")
+    return d
+
+
+def get_profile(con, role: str, profile_id: int, version: int | None = None) -> dict:
+    table, _ = _role(role)
+    q = f"SELECT * FROM {table} WHERE profile_id=?" + (" AND version=?" if version else "") + " ORDER BY version DESC LIMIT 1"
+    r = con.execute(q, (profile_id, version) if version else (profile_id,)).fetchone()
+    if not r:
+        raise AdvisorError(f"no {role} profile {profile_id}" + (f" v{version}" if version else ""))
+    return _decode(r)
+
+
+def _save_profile(con, role: str, fields: dict, name: str | None, profile_id: int | None) -> dict:
+    """New version of profile_id, or (without one) an existing profile whose latest version has the same fields,
+    or a new profile. Returns the stored row."""
+    table, cols = _role(role)
+    enc = {k: json.dumps(fields[k]) if k in _JSON_COLS else fields[k] for k in cols}
+    if profile_id is not None:
+        prev = get_profile(con, role, profile_id)
+        if all(prev[k] == fields[k] for k in cols) and (name is None or name == prev["name"]):
+            return prev
+        version, name = prev["version"] + 1, name or prev["name"]
+    else:
+        latest = con.execute(f"SELECT * FROM {table} p WHERE version=(SELECT max(version) FROM {table} WHERE profile_id=p.profile_id) "
+                             + "".join(f" AND {k} IS ?" for k in cols) + " ORDER BY profile_id DESC LIMIT 1",
+                             [enc[k] for k in cols]).fetchone()
+        if latest and (name is None or name == latest["name"]):
+            return _decode(latest)
+        profile_id = (con.execute(f"SELECT max(profile_id) FROM {table}").fetchone()[0] or 0) + 1
+        version = 1
+    con.execute(f"INSERT INTO {table} (profile_id, version, name, {', '.join(cols)}, created_at) VALUES (?,?,?,{','.join('?' * len(cols))},?)",
+                (profile_id, version, name, *[enc[k] for k in cols], store.now()))
+    return get_profile(con, role, profile_id, version)
+
+
+def _link(con, game: str, role: str, profile: dict) -> None:
+    cur = con.execute("SELECT profile_id, version, seq FROM game_profiles WHERE game=? AND role=? ORDER BY seq DESC LIMIT 1",
+                      (game, role)).fetchone()
+    if cur and (cur["profile_id"], cur["version"]) == (profile["profile_id"], profile["version"]):
+        return
+    con.execute("INSERT INTO game_profiles VALUES (?,?,?,?,?,?,?)", (game, role, (cur["seq"] if cur else 0) + 1, profile["profile_id"],
+                                                                    profile["version"], game_row(con, game)["current_g"], store.now()))
+
+
+def _advisor_preset(con, personality: str) -> dict:
+    p = presets.advisor(personality)
+    if not p:
+        raise AdvisorError(f"unknown advisor preset {personality!r}; one of: {', '.join(presets.advisors())} "
+                           "(or create_advisor_preset for a custom one)")
+    return p
+
+
 def set_advisor_profile(con, game: str, personality: str, voice: str = "", priorities: list[str] | None = None,
-                        quirks: str = "") -> dict:
-    _check(con, "personality", personality)
-    if not priorities:
-        priorities = json.loads(_vocab(con, "personality")[personality]["extra"] or "[]")
+                        quirks: str = "", name: str | None = None, profile_id: int | None = None) -> dict:
+    """Use an advisor for this game. personality is an advisor preset key (src/civilizer/advisors/ or data/advisors/).
+    With profile_id: a new version of that saved profile (other games keep the version they linked). Without: reuses a
+    saved profile with identical settings, else creates one. Either way the game is linked to it."""
+    preset = _advisor_preset(con, personality)
+    priorities = priorities or preset["priorities"]
     _check(con, "advisor_priority", priorities)
-    g = game_row(con, game)["current_g"]
-    v = (con.execute("SELECT max(version) FROM advisor_profiles WHERE game=?", (game,)).fetchone()[0] or 0) + 1
-    con.execute("INSERT INTO advisor_profiles VALUES (?,?,?,?,?,?,?,?)",
-                (game, v, personality, voice, json.dumps(priorities), quirks, g, store.now()))
+    prof = _save_profile(con, "advisor", {"personality": personality, "voice": voice, "priorities": priorities, "quirks": quirks},
+                         name if name or profile_id is not None else preset["label"], profile_id)
+    _link(con, game, "advisor", prof)
     return current_advisor_profile(con, game)
 
 
-def set_player_profile(con, game: str, playstyle: list[str], risk_tolerance: str = "medium", notes: str = "") -> dict:
-    if not playstyle:
-        raise AdvisorError("playstyle needs at least one value")
+def create_advisor_preset(con, key: str, label: str, description: str, prompt: str, priorities: list[str],
+                          overwrite: bool = False) -> dict:
+    """Write a custom advisor style prompt to data/advisors/<key>.md (shared across games)."""
+    if not priorities:
+        raise AdvisorError("priorities needs at least one value (vocab advisor_priority)")
+    _check(con, "advisor_priority", priorities)
+    try:
+        return presets.create_advisor(key, label, description, prompt, priorities, overwrite)
+    except presets.PresetError as e:
+        raise AdvisorError(str(e)) from e
+
+
+def _motive_phrase(p: dict) -> str:
+    return ", ".join(p.get("motives") or []) or "-"
+
+
+def _player_phrase(p: dict) -> str:
+    return f"motives {_motive_phrase(p)}; playstyle {', '.join(p['playstyle']) or '-'}; risk {p['risk_tolerance']}"
+
+
+def set_player_profile(con, game: str, playstyle: list[str] | None = None, risk_tolerance: str = "medium", notes: str = "",
+                       motives: list[str] | None = None, name: str | None = None, profile_id: int | None = None) -> dict:
+    """Use a player profile for this game; profile_id / reuse semantics as set_advisor_profile."""
+    playstyle, motives = playstyle or [], motives or []
+    if not playstyle and not motives:
+        raise AdvisorError("give at least one motive (fight, build, explore, mess_around, story) or playstyle")
     _check(con, "playstyle", playstyle)
+    _check(con, "motive", motives)
     if risk_tolerance not in ("low", "medium", "high"):
         raise AdvisorError("risk_tolerance must be low, medium or high")
-    g = game_row(con, game)["current_g"]
     prev = current_player_profile(con, game)
-    v = (prev["version"] if prev else 0) + 1
-    con.execute("INSERT INTO player_profiles VALUES (?,?,?,?,?,?,?)",
-                (game, v, json.dumps(playstyle), risk_tolerance, notes, g, store.now()))
-    if prev:
-        annotate(con, game, f"Playstyle changed: {', '.join(prev['playstyle'])} (risk {prev['risk_tolerance']}) -> "
-                 f"{', '.join(playstyle)} (risk {risk_tolerance})." + (f" {notes}" if notes else ""), "priority_change", "player")
-    return current_player_profile(con, game)
+    prof = _save_profile(con, "player", {"motives": motives, "playstyle": playstyle, "risk_tolerance": risk_tolerance,
+                                         "notes": notes}, name if name or profile_id is not None else "Player", profile_id)
+    _link(con, game, "player", prof)
+    cur = current_player_profile(con, game)
+    if prev and (prev["profile_id"], prev["version"]) != (cur["profile_id"], cur["version"]):
+        annotate(con, game, f"Playstyle changed: {_player_phrase(prev)} -> {_player_phrase(cur)}." + (f" {notes}" if notes else ""),
+                 "priority_change", "player")
+    return cur
 
 
-def _profiles(con, table: str, game: str, latest: bool) -> list[dict]:
-    rows = con.execute(f"SELECT * FROM {table} WHERE game=? ORDER BY version" + (" DESC LIMIT 1" if latest else ""), (game,))
+def use_profile(con, game: str, role: str, profile_id: int, version: int | None = None) -> dict:
+    """Link a saved profile (latest version unless given) to this game."""
+    prev = current_player_profile(con, game) if role == "player" else None
+    _link(con, game, role, get_profile(con, role, profile_id, version))
+    if role == "advisor":
+        return current_advisor_profile(con, game)
+    cur = current_player_profile(con, game)
+    if prev and (prev["profile_id"], prev["version"]) != (cur["profile_id"], cur["version"]):
+        annotate(con, game, f"Playstyle changed: {_player_phrase(prev)} -> {_player_phrase(cur)}.", "priority_change", "player")
+    return cur
+
+
+def list_profiles(con, role: str | None = None) -> list[dict]:
+    """Saved profiles (latest version each), most recently used first, with the games that used them."""
     out = []
-    for r in rows:
-        d = dict(r)
-        for k in ("priorities", "playstyle"):
-            if k in d:
-                d[k] = json.loads(d[k] or "[]")
-        out.append(d)
-    return out
+    for r in [role] if role else list(ROLES):
+        table, _ = _role(r)
+        for p in con.execute(f"SELECT * FROM {table} p WHERE version=(SELECT max(version) FROM {table} WHERE profile_id=p.profile_id)"):
+            d = _decode(p) | {"role": r}
+            uses = con.execute("SELECT gp.game, max(gp.created_at) AS at, g.leader FROM game_profiles gp LEFT JOIN games g USING (game) "
+                               "WHERE gp.role=? AND gp.profile_id=? GROUP BY gp.game ORDER BY at DESC", (r, d["profile_id"])).fetchall()
+            d["games"] = [{"game": u["game"], "leader": u["leader"]} for u in uses]
+            d["last_used"] = uses[0]["at"] if uses else None
+            out.append(d)
+    return sorted(out, key=lambda d: d["last_used"] or d["created_at"], reverse=True)
+
+
+def profile_history(con, game: str, role: str) -> list[dict]:
+    """Profile versions this game used, newest first (profile fields + seq, valid_from_g, linked_at)."""
+    table, _ = _role(role)
+    rows = con.execute(f"SELECT p.*, gp.seq, gp.valid_from_g, gp.created_at AS linked_at FROM game_profiles gp JOIN {table} p "
+                       "ON p.profile_id=gp.profile_id AND p.version=gp.version WHERE gp.game=? AND gp.role=? ORDER BY gp.seq DESC",
+                       (game, role))
+    return [_decode(r) for r in rows]
 
 
 def current_advisor_profile(con, game: str) -> dict | None:
-    d = next(iter(_profiles(con, "advisor_profiles", game, True)), None)
+    """The game's advisor profile plus its preset's style prompt (style_prompt) and file (style_file)."""
+    d = next(iter(profile_history(con, game, "advisor")), None)
     if d:
-        p = _vocab(con, "personality").get(d["personality"])
+        p = presets.advisor(d["personality"])
         d["personality_description"] = p["description"] if p else None
+        d["style_prompt"] = p["prompt"] if p else None
+        d["style_file"] = p["file"] if p else None
     return d
 
 
 def current_player_profile(con, game: str) -> dict | None:
-    d = next(iter(_profiles(con, "player_profiles", game, True)), None)
+    d = next(iter(profile_history(con, game, "player")), None)
     if d:
         ps = _vocab(con, "playstyle")
         d["playstyle_descriptions"] = {s: ps[s]["description"] for s in d["playstyle"] if s in ps}
@@ -244,17 +383,23 @@ def add_strategy(con, game: str, name: str, victory_types: list[str], descriptio
     return {"strategy_id": sid, "suggested_metrics": suggested_metrics(con, victory_types)}
 
 
-def set_strategy_status(con, game: str, strategy_id: int, status: str, note: str = "", verdict: str | None = None) -> dict:
+def _change(old: str, new: str) -> str:
+    return f"{old} -> {new}" if old != new else f"{new} (outcome re-judged)"
+
+
+def set_strategy_status(con, game: str, strategy_id: int, status: str, note: str = "", outcome: str | None = None) -> dict:
+    """Setting the current status again only records a new outcome; the original end turn is kept."""
     if status not in STATUSES:
         raise AdvisorError(f"status must be one of {', '.join(STATUSES)}")
+    outcome = _outcome(outcome) or STATUS_OUTCOME.get(status)
     s = _strategy(con, game, strategy_id)
     g = game_row(con, game)["current_g"]
-    con.execute("UPDATE strategies SET status=?, ended_g=? WHERE game=? AND strategy_id=?",
-                (status, None if status == "active" else g, game, strategy_id))
-    verdict = verdict or STATUS_VERDICT.get(status)
-    annotate(con, game, f"Strategy {strategy_id} ({s['name']}) {s['status']} -> {status}. {note}".strip(),
-             "outcome" if status != "active" else "priority_change", "player", verdict=verdict, strategy_id=strategy_id)
-    return {"strategy_id": strategy_id, "status": status, "verdict": verdict}
+    if status != s["status"]:
+        con.execute("UPDATE strategies SET status=?, ended_g=? WHERE game=? AND strategy_id=?",
+                    (status, None if status == "active" else g, game, strategy_id))
+    annotate(con, game, f"Strategy {strategy_id} ({s['name']}) {_change(s['status'], status)}. {note}".strip(),
+             "outcome" if status != "active" else "priority_change", "player", outcome=outcome, strategy_id=strategy_id)
+    return {"strategy_id": strategy_id, "status": status, "outcome": outcome}
 
 
 def strategies(con, game: str, active_only: bool = False) -> list[dict]:
@@ -356,17 +501,22 @@ def update_goal(con, game: str, goal_id: int, title: str | None = None, descript
     return dict(_goal(con, game, goal_id))
 
 
-def set_goal_status(con, game: str, goal_id: int, status: str, resolution: str = "", verdict: str | None = None) -> dict:
+def set_goal_status(con, game: str, goal_id: int, status: str, resolution: str = "", outcome: str | None = None) -> dict:
+    """Resolve or reopen a goal. Setting the current status again only records a new outcome (and the resolution,
+    if given); resolved_g is kept."""
     if status not in STATUSES:
         raise AdvisorError(f"status must be one of {', '.join(STATUSES)}")
+    outcome = _outcome(outcome) or STATUS_OUTCOME.get(status)
     goal = _goal(con, game, goal_id)
     g = game_row(con, game)["current_g"]
-    con.execute("UPDATE goals SET status=?, resolved_g=?, resolution=? WHERE game=? AND goal_id=?",
-                (status, None if status == "active" else g, resolution or None, game, goal_id))
-    verdict = verdict or STATUS_VERDICT.get(status)
-    annotate(con, game, f"Goal {goal_id} ({goal['title']}) {goal['status']} -> {status}. {resolution}".strip(),
-             "outcome" if status != "active" else "priority_change", "player", verdict=verdict, goal_id=goal_id)
-    return {"goal_id": goal_id, "status": status, "verdict": verdict}
+    if status != goal["status"]:
+        con.execute("UPDATE goals SET status=?, resolved_g=?, resolution=? WHERE game=? AND goal_id=?",
+                    (status, None if status == "active" else g, resolution or None, game, goal_id))
+    elif resolution:
+        con.execute("UPDATE goals SET resolution=? WHERE game=? AND goal_id=?", (resolution, game, goal_id))
+    annotate(con, game, f"Goal {goal_id} ({goal['title']}) {_change(goal['status'], status)}. {resolution}".strip(),
+             "outcome" if status != "active" else "priority_change", "player", outcome=outcome, goal_id=goal_id)
+    return {"goal_id": goal_id, "status": status, "outcome": outcome}
 
 
 def _progress(comparator: str, cur, base, target, rank) -> tuple[float | None, bool | None]:
@@ -431,9 +581,8 @@ def evaluate_goals(con, game: str, include_closed: bool = True) -> list[dict]:
                        **({"rank": rank, "of": st["of"]} if st else {}),
                        **({"gain": cur - (base or 0)} if cur is not None and m["comparator"].startswith("gain") else {}),
                        "progress": p, "met": met, "weight": m["weight"]})
-            if p is not None:
-                num += p * m["weight"]
-                den += m["weight"]
+            num += (p or 0) * m["weight"]  # an unmeasured metric counts as 0, so a goal can't read 100% (or alert "met") without it
+            den += m["weight"]
         d["metrics"] = ms
         d["metric_progress"] = num / den if den else None
         d["_num"], d["_den"] = num, den
@@ -498,6 +647,121 @@ def _compact_goal(g: dict) -> dict:
     return d
 
 
+# ---------------------------------------------------------------- setup wizard
+
+WIZARD_STEPS = ("advisor", "player", "strategy")
+PRESENT = ("Show the question and the options as a numbered list (n. label: description), exactly as given, and say the "
+           "player can answer with {how} or in their own words. Do not call the next tool until they answer.")
+
+
+def _saved_options(con, role: str, describe) -> list[dict]:
+    """Saved profiles of a role as wizard options (key 'profile:<id>'), most recently used first."""
+    out = []
+    for p in list_profiles(con, role)[:5]:
+        used = ", ".join(sorted({u["leader"] or u["game"] for u in p["games"]})) or "not used yet"
+        out.append({"key": f"profile:{p['profile_id']}", "label": f"Saved: {p['name']}", "description": f"{describe(p)} (used: {used})",
+                    "profile_id": p["profile_id"]})
+    return out
+
+
+def _numbered(options: list[dict]) -> list[dict]:
+    return [{"n": i} | o for i, o in enumerate(options, 1)]
+
+
+def setup_wizard(con, game: str, step: str | None = None) -> dict:
+    """Next setup question for Claude to put to the player: advisor preset, then player motives (plus Claude's own
+    follow-ups), then strategy presets. step forces one step (to change a choice later); otherwise the first missing."""
+    gr = game_row(con, game)
+    have = {"advisor": current_advisor_profile(con, game), "player": current_player_profile(con, game),
+            "strategy": strategies(con, game, active_only=True)}
+    done = [k for k in WIZARD_STEPS if have[k]]
+    if step is not None and step not in WIZARD_STEPS:
+        raise AdvisorError(f"step must be one of {', '.join(WIZARD_STEPS)}")
+    step = step or next((k for k in WIZARD_STEPS if not have[k]), None)
+    head = {"game": {k: gr[k] for k in ("leader", "civilization", "current_age", "current_turn", "current_g")}, "done": done}
+    if step is None:
+        return head | {"step": "done", "next": "Setup is complete: call briefing and advise in the advisor's style_prompt."}
+
+    if step == "advisor":
+        opts = _saved_options(con, "advisor", lambda p: f"{p['personality']}" + (f", {p['voice']}" if p["voice"] else ""))
+        opts += [{"key": k, "label": a["label"], "description": a["description"]} | ({"custom": True} if a["source"] == "custom" else {})
+                 for k, a in presets.advisors().items()]
+        opts.append({"key": "custom", "label": "Create your own",
+                     "description": "Describe the advisor you want (a character, a tone, a famous figure's style) and I'll write it."})
+        return head | {
+            "step": "advisor", "multi_select": False, "options": _numbered(opts),
+            "question": "Who should advise you this game?",
+            "present": PRESENT.format(how="a number"),
+            "on_answer": (
+                "Saved profile: use_profile(role=advisor, profile_id). "
+                "Preset: set_advisor_profile(personality=<key>) (saves a reusable profile). From then on, follow briefing.advisor_profile.style_prompt "
+                "(also in style_file) whenever you speak to the player. "
+                "Create your own (or a free-text description): ask one question if the description is too thin to write a "
+                "voice from, then draft a style prompt in the same shape as the built-ins (role line, then 4-6 bullets on "
+                "tone, structure, what to lead with, and the rule that the persona never bends the facts), show it to the "
+                "player, and on approval call create_advisor_preset(key, label, description, prompt, priorities) and then "
+                "set_advisor_profile(personality=<key>). The file is reused in later games."),
+            "advisor_priorities": {k: r["description"] for k, r in _vocab(con, "advisor_priority").items()},
+        }
+
+    if step == "player":
+        opts = _saved_options(con, "player", lambda p: _player_phrase(p) + (f"; {p['notes']}" if p["notes"] else ""))
+        opts += [{"key": k, "label": label, "description": d, "followup_angles": f} for k, (label, d, f) in presets.MOTIVES.items()]
+        return head | {
+            "step": "player", "multi_select": True, "options": _numbered(opts),
+            "question": "What are you here for this game? Pick a saved profile, or any motives that apply.",
+            "present": PRESENT.format(how="numbers (e.g. 2, 5)") + " Leave out followup_angles when presenting.",
+            "on_answer": (
+                "Saved profile: use_profile(role=player, profile_id), then ask if anything changed this game; if so, "
+                "set_player_profile(profile_id=<id>, ...) makes a new version of it. "
+                "Otherwise ask 1-2 follow-up questions you write yourself, one at a time, built from the chosen motives' "
+                "followup_angles, the leader/civ in play and anything the player already said (numbered options when "
+                "natural, always allowing free text). Stop when you know what they enjoy, what they want to avoid and "
+                "how much risk they accept. Then summarize the profile in one or two lines, and call "
+                "set_player_profile(motives=[keys], playstyle=[inferred vocab playstyle], risk_tolerance=low|medium|high, "
+                "notes=<their answers, in their words>, name=<short name, e.g. the player's name>). It is saved for "
+                "future games."),
+            "playstyles": {k: r["description"] for k, r in _vocab(con, "playstyle").items()},
+        }
+
+    pp = have["player"]
+    opts = [{"key": k, "label": label, "description": d} for k, (label, d, _, _) in presets.STRATEGIES.items()]
+    return head | {
+        "step": "strategy", "multi_select": True, "options": _numbered(opts),
+        "question": "What are you going for? Pick one or more.",
+        "player_profile": pp and {k: pp[k] for k in ("motives", "playstyle", "risk_tolerance")},
+        "present": PRESENT.format(how="numbers (e.g. 1, 3)") + " You may mark one option (Recommended) based on the "
+                   "player profile and the leader/civ, with a one-line reason.",
+        "on_answer": "choose_strategy(presets=[keys], notes=<anything the player added>). It returns guidance and "
+                     "suggested metrics: propose one long-term goal and one or two short-term goals with metrics and "
+                     "deadlines, confirm with the player, then add_goal.",
+    }
+
+
+def choose_strategy(con, game: str, preset_keys: list[str], victory_types: list[str] | None = None, name: str | None = None,
+                    notes: str = "") -> dict:
+    """Adopt a strategy from wizard presets. 'just_win' without other presets needs victory_types chosen by the advisor:
+    without them nothing is written and the reply says what to decide."""
+    unknown = [k for k in preset_keys if k not in presets.STRATEGIES]
+    if not preset_keys or unknown:
+        raise AdvisorError(f"unknown strategy preset(s) {unknown}; one of: {', '.join(presets.STRATEGIES)}")
+    chosen = [presets.STRATEGIES[k] for k in preset_keys]
+    vt = list(victory_types or [])
+    for _, _, types, _ in chosen:
+        vt += [t for t in types if t not in vt]
+    guidance = {k: presets.STRATEGIES[k][3] for k in preset_keys}
+    if not vt:  # only just_win, and the advisor has not picked a path yet
+        gr = game_row(con, game)
+        return {"needs_victory_types": guidance["just_win"], "leader": gr["leader"], "civilization": gr["civilization"],
+                "victory_types": list(_vocab(con, "strategy_focus"))}
+    name = name or " + ".join(label for label, _, _, _ in chosen)
+    desc = " ".join(d for _, d, _, _ in chosen) + (f" Player: {notes}" if notes else "")
+    if "just_win" in preset_keys:
+        desc += f" Advisor picked {', '.join(vt)}."
+    return add_strategy(con, game, name, vt, desc) | {"victory_types": vt, "guidance": guidance,
+                                                       "next": "Propose starter goals with metrics, confirm, then add_goal."}
+
+
 # ---------------------------------------------------------------- history and phases
 
 def history(con, game: str, what: str | None = None) -> list[dict]:
@@ -505,13 +769,14 @@ def history(con, game: str, what: str | None = None) -> list[dict]:
     intention / priority_change / outcome annotation. what: profile, strategy, goal, or None for all."""
     out = []
     if what in (None, "profile"):
-        for p in _profiles(con, "advisor_profiles", game, False):
-            out.append({"g": p["valid_from_g"], "at": p["created_at"], "what": "advisor_profile", "version": p["version"],
-                        "text": f"Advisor v{p['version']}: {p['personality']} (priorities {', '.join(p['priorities'])})"
+        for p in profile_history(con, game, "advisor")[::-1]:
+            out.append({"g": p["valid_from_g"], "at": p["linked_at"], "what": "advisor_profile", "version": p["version"],
+                        "text": f"Advisor {p['name']} (profile {p['profile_id']} v{p['version']}): {p['personality']} "
+                                f"(priorities {', '.join(p['priorities'])})"
                                 + (f"; voice: {p['voice']}" if p["voice"] else "") + (f"; quirks: {p['quirks']}" if p["quirks"] else "")})
-        for p in _profiles(con, "player_profiles", game, False):
-            out.append({"g": p["valid_from_g"], "at": p["created_at"], "what": "player_profile", "version": p["version"],
-                        "text": f"Player v{p['version']}: {', '.join(p['playstyle'])}, risk {p['risk_tolerance']}"
+        for p in profile_history(con, game, "player")[::-1]:
+            out.append({"g": p["valid_from_g"], "at": p["linked_at"], "what": "player_profile", "version": p["version"],
+                        "text": f"Player {p['name']} (profile {p['profile_id']} v{p['version']}): {_player_phrase(p)}"
                                 + (f"; {p['notes']}" if p["notes"] else "")})
     q = "SELECT * FROM annotations WHERE game=? AND kind IN ('intention','priority_change','outcome')"
     if what == "strategy":
@@ -522,14 +787,14 @@ def history(con, game: str, what: str | None = None) -> list[dict]:
         q += " AND 0"
     for a in con.execute(q, (game,)):
         out.append({"g": a["g"], "at": a["created_at"], "what": a["kind"], "annotation_id": a["annotation_id"], "author": a["author"],
-                    "goal_id": a["goal_id"], "strategy_id": a["strategy_id"], "verdict": a["verdict"], "text": a["text"]})
+                    "goal_id": a["goal_id"], "strategy_id": a["strategy_id"], "outcome": a["outcome"], "text": a["text"]})
     out.sort(key=lambda e: (e["at"] or "", e["g"] or 0))
     return out
 
 
 def phases(con, game: str, scope: str | None = None, with_facts: bool = True) -> list[dict]:
     """Phase fact sheets plus the advisor layer on top: narrative/outcome annotations on the same scope, and
-    advisor_verdict (latest outcome annotation's verdict), which overrides the heuristic verdict in `effective_verdict`."""
+    advisor_outcome (latest outcome annotation's outcome), which overrides heuristic_outcome in `effective_outcome`."""
     q, args = "SELECT * FROM phases WHERE game=?", [game]
     if scope:
         q += " AND scope=?"
@@ -543,11 +808,11 @@ def phases(con, game: str, scope: str | None = None, with_facts: bool = True) ->
         d = dict(p)
         d["facts"] = json.loads(d["facts"] or "{}") if with_facts else None
         ns = notes.get((p["scope"], p["scope_key"]), [])
-        verdicts = [a for a in ns if a["kind"] == "outcome" and a["verdict"]]
-        d["heuristic_verdict"] = d.pop("verdict")
-        d["advisor_verdict"] = verdicts[-1]["verdict"] if verdicts else None
-        d["effective_verdict"] = d["advisor_verdict"] or d["heuristic_verdict"]
-        d["annotations"] = [{k: a[k] for k in ("annotation_id", "g", "kind", "author", "verdict", "text")} for a in ns]
+        judged = [a for a in ns if a["kind"] == "outcome" and a["outcome"]]
+        d["heuristic_outcome"] = store.outcome_of(d.pop("outcome"))
+        d["advisor_outcome"] = judged[-1]["outcome"] if judged else None
+        d["effective_outcome"] = d["advisor_outcome"] or d["heuristic_outcome"]
+        d["annotations"] = [{k: a[k] for k in ("annotation_id", "g", "kind", "author", "outcome", "text")} for a in ns]
         d["needs_narrative"] = not any(a["kind"] == "narrative" for a in ns)
         out.append(d)
     return out
@@ -558,11 +823,16 @@ def phases(con, game: str, scope: str | None = None, with_facts: bool = True) ->
 KEY_METRICS = ["gold_per_turn", "science_per_turn", "culture_per_turn", "production_per_turn", "food_per_turn",
                "happiness_per_turn", "influence_per_turn", "gold_balance", "influence_balance", "settlements", "settlement_cap",
                "population", "military_units", "wars_active", "unrest_settlements", "trade_routes", "triumphs_done",
-               "units_lost_total", "units_killed_total"]
+               "units_lost_total", "units_killed_total", "trade_income_per_turn", "combat_gold_total", "suzerainties",
+               "befriend_actions_active", "influence_spent_total"]
 STANDINGS = ["vp_economic", "vp_science", "vp_culture", "vp_military", "score"]
-ENDED_KINDS = ("war", "alliance", "policy", "government", "production", "project", "tech_research", "civic_research")
+ENDED_KINDS = ("war", "alliance", "policy", "government", "production", "project", "tech_research", "civic_research",
+               "diplomacy_action", "befriend", "suzerain")
 EVENT_DETAIL = ("city", "item", "category", "completed", "victim", "killer", "war_type", "declared_by", "captured_by",
-                "from_player", "type", "population")
+                "from_player", "type", "population",
+                # diplomacy
+                "action", "group", "initiator_name", "recipient_name", "stage", "response", "proposer", "outcome", "end_reason",
+                "lost_to_name", "bonus", "rivals", "turn_influence_spent", "previous", "relationship")
 
 
 def _events_since(con, game: str, since: int, cg: int, cap: int) -> dict:
@@ -585,16 +855,92 @@ def _events_since(con, game: str, since: int, cg: int, cap: int) -> dict:
              "phase": "started" if started else "ended", "players": json.loads(r["players"]), "event_key": r["event_key"]}
         if r["minor"]:
             e["minor"] = True
-        e |= {k: det[k] for k in EVENT_DETAIL if det.get(k) is not None}
+        # end_reason and the start turn's influence spending belong to one phase each
+        e |= {k: det[k] for k in EVENT_DETAIL if det.get(k) is not None
+              and not (k == "end_reason" and started) and not (k == "turn_influence_spent" and not started)}
         out.append(e)
-    # majors and outcomes before noise: city-state wars and purchases sort last when capping
-    noise = lambda e: (e.get("minor", False), e["kind"] in ("purchase", "policy"), -e["g"])
+    # majors and outcomes before noise: city-state wars, purchases and attitude drift sort last when capping (the
+    # player's own befriending and suzerainties involve a city-state but are not noise)
+    noise = lambda e: (e.get("minor", False) and e["kind"] not in ("suzerain", "befriend"),
+                       e["kind"] in ("purchase", "policy", "relationship", "met"), -e["g"])
     kept = sorted(out, key=noise)[:cap]
     omitted: dict = {}
     for e in out:
         if e not in kept:
             omitted[e["kind"]] = omitted.get(e["kind"], 0) + 1
     return {"events": sorted(kept, key=lambda e: (e["g"], e["kind"])), "omitted": omitted}
+
+
+def diplomacy_since(con, game: str, since: int, cg: int) -> dict:
+    """The local player's diplomacy in (since, cg] beyond start/end events: befriending and other actions that moved
+    (stage entered, support added), and every befriending still running with its stage, support and racing rivals.
+
+    {"progress": [{g, kind, subject, stages: [...], support_added}], "befriending": [{subject, since_g, stage, support,
+    rivals}], "suzerain_of": [names]}. Empty dict when there is nothing."""
+    gr = game_row(con, game)
+    me, g_off = gr["local_player_id"], dict(con.execute("SELECT age, g_offset FROM ages WHERE game=?", (game,)).fetchall())
+    progress, active, suz = [], [], []
+    for r in con.execute("SELECT * FROM events WHERE game=? AND local=1 AND kind IN ('diplomacy_action','befriend','suzerain') "
+                         "AND start_g<=? AND (end_g IS NULL OR end_g>?) ORDER BY start_g", (game, cg, since)):
+        d = json.loads(r["detail"] or "{}")
+        ongoing = r["end_g"] is None or d.get("end_reason") == "age_end_or_ongoing"
+        if r["kind"] == "suzerain":
+            if ongoing:
+                suz.append(d.get("city_state_name") or r["subject"])
+            continue
+        off = g_off.get(r["start_age"], 0)
+        stages = [s["stage"] for s in d.get("stages") or [] if since < off + s["turn"] <= cg and off + s["turn"] != r["start_g"]]
+        added = sum(x.get("support", 0) for x in d.get("support_log") or []
+                    if since < off + x["turn"] <= cg and off + x["turn"] != r["start_g"] and x.get("player") == me)
+        if stages or added:
+            progress.append({"g": r["start_g"], "kind": r["kind"], "subject": r["subject"]}
+                            | ({"stages": stages} if stages else {}) | ({"support_added": added} if added else {}))
+        if r["kind"] == "befriend" and ongoing and d.get("initiator") == me:
+            active.append({"subject": r["subject"], "since_g": r["start_g"], "stage": d.get("stage"),
+                           "support": (d.get("support") or {}).get(str(me))} | ({"rivals": d["rivals"]} if d.get("rivals") else {}))
+    out: dict = {}
+    if progress:
+        out["progress"] = progress
+    if active:
+        out["befriending"] = active
+    if suz:
+        out["suzerain_of"] = suz
+    return out
+
+
+def combat_rewards_since(con, game: str, pid: int, since: int, cg: int) -> dict:
+    """Combat rewards the player gained in (since, cg], and the unattributed gold of the same turns.
+
+    {"by_kind": {kind: {count, yields: {YIELD_X: exact amount}, unknown_amount: n}},
+     "other_gold": {"gained": x, "lost": y, "turns": [{g, gold, combat_events: {kind: n}}]}}
+    yields sum only exact amounts (rules, notification); unknown_amount counts rows the game does not log an amount for
+    (pillage, plunder, most dispersals). other_gold is the unexplained_gold metric for g in [since, cg] (turn g's value
+    needs turn g+1's treasury, so it lands a turn late; |gold| < 1 is rounding and skipped): treasury change not explained
+    by income or purchases, never attributed to combat. gained sums the positive turns (as unexplained_gold_total). Each turn lists that turn's combat event counts so the advisor can judge what it was."""
+    by_kind: dict = {}
+    for r in con.execute("SELECT kind, yield_type, amount FROM combat_rewards WHERE game=? AND player_id=? AND g>? AND g<=?",
+                         (game, pid, since, cg)):
+        k = by_kind.setdefault(r["kind"], {"count": 0, "yields": {}})
+        k["count"] += 1
+        if r["amount"] is None:
+            k["unknown_amount"] = k.get("unknown_amount", 0) + 1
+        else:
+            y = r["yield_type"] or "unknown"
+            k["yields"][y] = round(k["yields"].get(y, 0) + r["amount"], 2)
+    turns = []
+    for r in con.execute("SELECT g, value FROM metrics WHERE game=? AND player_id=? AND metric='unexplained_gold' AND g>=? AND g<=? "
+                         "AND abs(value)>=1 ORDER BY g", (game, pid, since, cg)):
+        counts = {c["kind"]: c["n"] for c in con.execute(
+            "SELECT kind, count(*) AS n FROM combat_rewards WHERE game=? AND player_id=? AND g=? GROUP BY kind ORDER BY kind",
+            (game, pid, r["g"]))}
+        turns.append({"g": r["g"], "gold": r["value"]} | ({"combat_events": counts} if counts else {}))
+    out: dict = {}
+    if by_kind:
+        out["by_kind"] = by_kind
+    if turns:
+        out["other_gold"] = {"gained": round(sum(t["gold"] for t in turns if t["gold"] > 0), 2),
+                             "lost": round(sum(t["gold"] for t in turns if t["gold"] < 0), 2), "turns": turns}
+    return out
 
 
 def briefing(con, game: str | None = None, since_g: int | None = None, max_events: int = 25, max_annotations: int = 8) -> dict:
@@ -623,6 +969,8 @@ def briefing(con, game: str | None = None, since_g: int | None = None, max_event
         standings[m] = {"rank": s["rank"], "of": s["of"], "value": v} | ({"target": t} if t else {}) | (
             {"leader": lead["leader"], "leader_value": lead["value"]} if lead and lead["player_id"] != me else {})
     ev = _events_since(con, game, since, cg, max_events)
+    combat = combat_rewards_since(con, game, me, since, cg)
+    diplo = diplomacy_since(con, game, since, cg)
     summary = con.execute("SELECT summary FROM turns WHERE game=? ORDER BY g DESC LIMIT 1", (game,)).fetchone()
     goals = evaluate_goals(con, game, include_closed=False)
     tree = goal_tree(con, game, active_only=True)
@@ -631,9 +979,9 @@ def briefing(con, game: str | None = None, since_g: int | None = None, max_event
              "goals": [_compact_goal(g) for g in s["goals"]]} for s in tree]
     ap, pp = current_advisor_profile(con, game), current_player_profile(con, game)
     setup = [msg for cond, msg in (
-        (not ap, "No advisor personality yet: ask the player to pick one (vocabulary field=personality) and set_advisor_profile."),
-        (not pp, "No player profile yet: ask how they like to play and set_player_profile."),
-        (not plan, "No strategy or goals yet: ask what they are going for and add_strategy / add_goal with metrics."),
+        (not ap, "No advisor yet: run setup_wizard (step advisor)."),
+        (not pp, "No player profile yet: run setup_wizard (step player)."),
+        (not plan, "No strategy or goals yet: run setup_wizard (step strategy)."),
     ) if cond]
     gi = {k: gr[k] for k in ("game", "leader", "civilization", "difficulty", "current_age", "current_turn", "current_g",
                              "age_turns_max", "local_player_id", "updated_at")}
@@ -643,14 +991,17 @@ def briefing(con, game: str | None = None, since_g: int | None = None, max_event
         gi["civilization"] = json.loads(lp["civilizations"] or "{}").get(gr["current_age"]) or gi["civilization"]
     return {
         "game": gi, "since_g": since,
-        "advisor_profile": ap and {k: ap[k] for k in ("version", "personality", "personality_description", "voice", "priorities", "quirks")},
-        "player_profile": pp and {k: pp[k] for k in ("version", "playstyle", "risk_tolerance", "notes")},
+        "advisor_profile": ap and {k: ap[k] for k in ("profile_id", "version", "name", "personality", "personality_description",
+                                                     "style_prompt", "style_file", "voice", "priorities", "quirks")},
+        "player_profile": pp and {k: pp[k] for k in ("profile_id", "version", "name", "motives", "playstyle", "risk_tolerance", "notes")},
         "plan": plan,
         "state": state, "standings": standings,
         "local_summary": json.loads(summary[0]) if summary and summary[0] else None,
         "events_since": ev["events"], **({"events_omitted": ev["omitted"]} if ev["omitted"] else {}),
+        **({"combat_rewards_since": combat} if combat else {}),
+        **({"diplomacy": diplo} if diplo else {}),
         "alerts": _alerts(state, standings, goals),
-        "recent_annotations": [{k: a[k] for k in ("annotation_id", "g", "author", "kind", "text", "verdict", "goal_id", "scope", "scope_key")
+        "recent_annotations": [{k: a[k] for k in ("annotation_id", "g", "author", "kind", "text", "outcome", "goal_id", "scope", "scope_key")
                                 if a[k] is not None} for a in annotations(con, game, limit=max_annotations)],
         **({"setup_needed": setup} if setup else {}),
         "monitor": {"last_refresh": json.loads(store.get_meta(con, "last_refresh") or "null"),
@@ -675,6 +1026,8 @@ def _alerts(state: dict, standings: dict, goals: list[dict]) -> list[str]:
     if d("wars_active") and d("wars_active") > 0:
         a.append(f"Wars with majors up by {d('wars_active'):.0f}.")
     for m, s in standings.items():
+        if (s.get("target") or 0) <= 0:  # no target published yet (the game reports -1 early on)
+            continue
         if s.get("target") and s.get("value") is not None and s["value"] >= s["target"]:
             a.append(f"{m} at {s['value']:.0f} has reached its victory target {s['target']:.0f}.")
         elif s.get("target") and s.get("leader_value") is not None and s["leader_value"] >= 0.85 * s["target"]:

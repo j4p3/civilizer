@@ -2,15 +2,17 @@
 
 Stdlib only. Every request opens its own read-only SQLite connection, so the dashboard never blocks or
 writes to the store while the monitor appends turns; the page polls /api/version and refetches when the
-token changes. The UI (web/index.html, app.js, style.css) is vanilla JS with inline SVG, no CDN, so it
-works offline. Narrative prose is never generated here: the Story view shows the phases' facts and the
+token changes. The UI (web/index.html, app.js, style.css) is vanilla JS on the Foolscap design system
+(github.com/j4p3/foolscap): its tokens, components and fonts, and its Observable Plot helper for figures, are
+vendored under web/foolscap/ by scripts/vendor-foolscap.sh, so the page needs no CDN and works offline. Narrative prose is never generated here: the Story view shows the phases' facts and the
 advisor's annotations (Claude writes those), with an empty state until they exist.
 
 Endpoints (all GET, all JSON, optional ?game=<seed>, default the most recently refreshed game):
+  /api/games                   every game in the store, newest first, for the home screen; monitor status
   /api/version                 cheap change token (refresh time, monitor heartbeat, advisor-table writes)
   /api/game                    game, ages, players, metric catalog, observed turns, monitor status
-  /api/overview                stat tiles with recent trend, victory standings, active wars, phase verdicts
-  /api/phases                  phase fact sheets + their annotations + effective verdict, intention notes
+  /api/overview                stat tiles with recent trend, victory standings, active wars, phase outcomes
+  /api/phases                  phase fact sheets + their annotations + effective outcome, intention notes
   /api/timeline?local=1&kinds=a,b&from=&to=   events for the swimlanes
   /api/metrics?metric=m&players=0,1&vis=visible|all   one series per player
   /api/turn/<g>                one turn: events, metric deltas vs previous observed turn, summary, notes
@@ -32,7 +34,7 @@ from urllib.parse import parse_qs, urlparse
 from . import store
 
 WEB = Path(__file__).resolve().parent / "web"
-MAJORS_MAX = 8  # palette slots: one fixed color per major player id 0..7
+MAJORS_MAX = 12  # palette slots: one fixed Foolscap chart color per major player id 0..11
 
 TILE_METRICS = ["gold_per_turn", "science_per_turn", "culture_per_turn", "production_per_turn", "food_per_turn",
                 "happiness_per_turn", "influence_per_turn", "gold_balance", "settlements", "population",
@@ -131,6 +133,16 @@ def _monitor(con) -> dict:
     return out
 
 
+def _outcome(con, gr: sqlite3.Row) -> dict:
+    """Over (someone won a victory), in progress, or unknown (no snapshot with victory data yet), with winner names."""
+    d = dict(gr)
+    names = {r[0]: r[1] for r in con.execute("SELECT player_id, leader FROM players WHERE game=?", (gr["game"],))}
+    wins = _j(d.get("victories"), []) or []
+    return {"status": d.get("status") or "unknown",
+            "victories": [{"victory": v.get("victory"), "players": [{"id": p, "leader": names.get(p)} for p in v.get("players") or []]}
+                          for v in wins]}
+
+
 def _latest(con, game: str, metric: str, pid: int, g: int, lo: int = -10**9, vis: str = "all") -> tuple[float | None, int | None]:
     sql = "SELECT value, g FROM metrics WHERE game=? AND metric=? AND player_id=? AND g BETWEEN ? AND ?"
     if vis == "visible":
@@ -147,7 +159,8 @@ def api_version(con, q: dict) -> dict:
     parts = [gr["updated_at"] if gr else None, gr["current_g"] if gr else None, store.get_meta(con, "last_refresh")]
     tabs = _tables(con)
     for t, col in (("annotations", "annotation_id"), ("goals", "goal_id"), ("strategies", "strategy_id"),
-                   ("advisor_profiles", "version"), ("player_profiles", "version"), ("goal_metrics", "goal_id")):
+                   ("advisor_profiles", "version"), ("player_profiles", "version"), ("game_profiles", "seq"),
+                   ("goal_metrics", "goal_id")):
         if t in tabs:
             parts.append(tuple(con.execute(f"SELECT count(*), max({col}) FROM {t}").fetchone()))
     if "goals" in tabs:
@@ -159,6 +172,22 @@ def api_version(con, q: dict) -> dict:
             "updated_at": gr["updated_at"] if gr else None, "monitor": _monitor(con)}
 
 
+def api_games(con, q: dict) -> dict:
+    mon = _monitor(con)
+    out = []
+    for r in con.execute("SELECT * FROM games ORDER BY updated_at DESC"):
+        d, game = dict(r), r["game"]
+        me = con.execute("SELECT leader, civilizations FROM players WHERE game=? AND player_id=?", (game, r["local_player_id"])).fetchone()
+        d["leader_name"] = me["leader"] if me else None
+        d["civilizations"] = _j(me["civilizations"], {}) if me else {}
+        d["turns_observed"], d["first_g"] = con.execute("SELECT count(*), min(g) FROM turns WHERE game=?", (game,)).fetchone()
+        d["ages"] = [a[0] for a in con.execute("SELECT age FROM ages WHERE game=? ORDER BY idx", (game,))]
+        d["watching"] = mon.get("state") == "watching" and not mon["stale"] and str(mon.get("game")) == game
+        d["outcome"] = _outcome(con, r)
+        out.append(d)
+    return {"games": out, "monitor": mon}
+
+
 def api_game(con, q: dict) -> dict:
     gr = _game(con, q)
     if not gr:
@@ -167,7 +196,7 @@ def api_game(con, q: dict) -> dict:
     ages = _ages(con, game, gr)
     summary = con.execute("SELECT g, summary FROM turns WHERE game=? ORDER BY g DESC LIMIT 1", (game,)).fetchone()
     return {
-        "game": dict(gr),
+        "game": dict(gr) | {"outcome": _outcome(con, gr)},
         "games": [dict(r) for r in con.execute("SELECT game, leader, civilization, current_age, current_g, updated_at FROM games "
                                                "ORDER BY updated_at DESC")],
         "ages": ages,
@@ -249,14 +278,16 @@ def api_overview(con, q: dict) -> dict:
         k, lost = _combat(con, game, me, opp, e["start_g"], cg) if opp is not None else (0, 0)
         wars.append({"event_key": e["event_key"], "opponent": opp, "major": opp in majors, "since_g": e["start_g"],
                      "turns": cg - e["start_g"] + 1, "war_type": e["detail"].get("war_type"),
-                     "declared_by": e["detail"].get("declared_by"), "units_killed": k, "units_lost": lost})
-    phases = [{"scope": r["scope"], "scope_key": r["scope_key"], "title": r["title"], "verdict": r["verdict"],
+                     "declared_by": e["detail"].get("declared_by"), "units_killed": k, "units_lost": lost,
+                     "war_support": _latest(con, game, "war_support", opp, cg, e["start_g"])[0] if opp is not None else None})
+    phases = [{"scope": r["scope"], "scope_key": r["scope_key"], "title": r["title"], "outcome": r["outcome"],
                "g_start": r["g_start"], "g_end": r["g_end"]} for r in con.execute(
         "SELECT * FROM phases WHERE game=? ORDER BY CASE scope WHEN 'game' THEN 0 WHEN 'age' THEN 1 WHEN 'war' THEN 2 ELSE 3 END, g_start",
         (game,))]
     _apply_outcomes(con, game, phases)
+    blurbs = _annotations(con, game, "kind='blurb' AND scope='game'")
     return {"game": dict(gr), "visibility": vis, "tiles": tiles, "standings": _standings(con, game, cg, majors, me, vis),
-            "wars": wars, "phases": phases}
+            "wars": wars, "phases": phases, "blurb": blurbs[-1]["text"] if blurbs else None}
 
 
 def _annotations(con, game: str, where: str = "1", args: tuple = ()) -> list[dict]:
@@ -267,16 +298,16 @@ def _annotations(con, game: str, where: str = "1", args: tuple = ()) -> list[dic
 
 
 def _apply_outcomes(con, game: str, phases: list[dict]) -> None:
-    """An advisor `outcome` annotation's verdict overrides the heuristic verdict of the phase it scopes."""
+    """An advisor `outcome` annotation's outcome overrides the heuristic outcome of the phase it scopes."""
     latest = {}
-    for a in _annotations(con, game, "kind='outcome' AND verdict IS NOT NULL AND scope IS NOT NULL"):
+    for a in _annotations(con, game, "kind='outcome' AND outcome IS NOT NULL AND scope IS NOT NULL"):
         latest[(a["scope"], a["scope_key"])] = a
     for p in phases:
         a = latest.get((p["scope"], p["scope_key"]))
-        p["heuristic_verdict"] = p["verdict"]
-        p["verdict_source"] = "advisor" if a else "heuristic"
+        p["heuristic_outcome"] = p["outcome"] = store.outcome_of(p["outcome"])
+        p["outcome_source"] = "advisor" if a else "heuristic"
         if a:
-            p["verdict"] = a["verdict"]
+            p["outcome"] = a["outcome"]
 
 
 def api_phases(con, q: dict) -> dict:
@@ -374,17 +405,11 @@ def api_turn(con, q: dict, g: int | None) -> dict:
             "annotations": _annotations(con, game, "g=?", (g,)), **nav}
 
 
-def _history(con, table: str, game: str) -> list[dict]:
-    if table not in _tables(con):
+def _history(con, role: str, game: str) -> list[dict]:
+    if "game_profiles" not in _tables(con):
         return []
-    out = []
-    for r in con.execute(f"SELECT * FROM {table} WHERE game=? ORDER BY version DESC", (game,)):
-        d = dict(r)
-        for k in ("priorities", "playstyle"):
-            if k in d:
-                d[k] = _j(d[k], [])
-        out.append(d)
-    return out
+    from . import advisor
+    return advisor.profile_history(con, game, role)
 
 
 def api_advisor(con, q: dict) -> dict:
@@ -393,7 +418,7 @@ def api_advisor(con, q: dict) -> dict:
     vocab = {}
     for r in con.execute("SELECT field, value, description FROM vocab"):
         vocab.setdefault(r[0], {})[r[1]] = r[2]
-    advisors, players = _history(con, "advisor_profiles", game), _history(con, "player_profiles", game)
+    advisors, players = _history(con, "advisor", game), _history(con, "player", game)
     plan, plan_error = [], None
     try:
         from . import advisor
@@ -406,7 +431,7 @@ def api_advisor(con, q: dict) -> dict:
             "annotations": _annotations(con, game)[::-1]}
 
 
-ROUTES = {"/api/version": api_version, "/api/game": api_game, "/api/overview": api_overview, "/api/phases": api_phases,
+ROUTES = {"/api/games": api_games, "/api/version": api_version, "/api/game": api_game, "/api/overview": api_overview, "/api/phases": api_phases,
           "/api/timeline": api_timeline, "/api/metrics": api_metrics, "/api/advisor": api_advisor}
 
 

@@ -25,6 +25,7 @@ STATS_METRIC = {"cities": "cities", "towns": "towns", "settlement_cap": "settlem
                 "gold": "gold_per_turn", "production": "production_per_turn", "food": "food_per_turn",
                 "happiness": "happiness_per_turn", "influence": "influence_per_turn"}
 COMBAT_CLASSES = {"FORMATION_CLASS_LAND_COMBAT", "FORMATION_CLASS_NAVAL", "FORMATION_CLASS_AIR"}
+DIGEST_VERSION = 4  # bump when digest() gains fields: cached digests of older versions are recomputed
 
 
 # ---------------------------------------------------------------- snapshot digests
@@ -50,6 +51,9 @@ def digest(s: dict) -> dict:
     routes = (s.get("trade") or {}).get("routes") or {}
     if "established" in routes:
         mine["trade_routes"] = len(routes["established"])
+    income = (s.get("trade") or {}).get("trade_income_total")
+    if isinstance(income, dict):
+        mine["trade_income_per_turn"] = income.get("YIELD_GOLD", 0)
     if s.get("units") is not None:
         mine["military_units"] = sum(u.get("class") in COMBAT_CLASSES for u in s["units"])
     rivals = s.get("players") or []
@@ -58,14 +62,32 @@ def digest(s: dict) -> dict:
         mine["triumphs_done"] = sum(bool(t.get("done")) for t in s["triumphs"])
     if (g.get("age_progress") or {}).get("current") is not None:
         mine["age_progress"] = g["age_progress"]["current"]
+    city_states = s.get("city_states")
+    if isinstance(city_states, list):  # met city-states and their suzerains, as the player sees them
+        ids = {me.get("leader"): pid} | {p.get("leader"): p["id"] for p in rivals if p.get("leader")}
+        held: dict[int, int] = defaultdict(int)
+        for c in city_states:
+            z = c.get("suzerain")
+            zid = z if isinstance(z, int) else ids.get(z)  # older snapshots wrote the suzerain's id, newer ones its name
+            if zid is not None and zid >= 0:
+                held[zid] += 1
+        mine["suzerainties"] = held.get(pid, 0)
+        for p in rivals:
+            if p.get("met"):
+                m[p["id"]]["suzerainties"] = held.get(p["id"], 0)
     for p in rivals:
         if not p.get("met"):
             continue
+        if p.get("relationship_level") is not None:
+            m[p["id"]]["relationship"] = p["relationship_level"]
         for y, v in (p.get("per_turn") or {}).items():
             if y in YIELD_METRIC and v is not None:
                 m[p["id"]][YIELD_METRIC[y]] = v
         if p.get("settlements") is not None:
             m[p["id"]]["settlements"] = p["settlements"]
+        # supporters minus opposers of the war between us (model-diplo-ribbon.js), from the local player's side
+        if isinstance((p.get("war_support") or {}).get("our_support"), (int, float)):
+            m[p["id"]]["war_support"] = p["war_support"]["our_support"]
     for cv in s.get("countdown_victories") or []:
         name = VP_METRIC.get(cv.get("victory"))
         if not name:
@@ -88,11 +110,24 @@ def digest(s: dict) -> dict:
         "crisis_policies": me.get("crisis_policies") or [], "ideology": me.get("ideology"), "religion": me.get("religion"),
         "golden_age": me.get("golden_age"), "at_war_with": [p["id"] for p in rivals if p.get("at_war")],
         "age_progress": g.get("age_progress"), "notifications_unit_lost": lost,
-        "settlements": [{k: c.get(k) for k in ("name", "type", "population", "capital", "x", "y")} for c in cities],
+        "settlements": [{k: c.get(k) for k in ("name", "type", "population", "capital", "being_razed", "x", "y")} for c in cities],
+        "city_states": [{k: c.get(k) for k in ("id", "name", "suzerain", "at_war")} for c in city_states]
+        if isinstance(city_states, list) else None,
+        "relationships": {str(p["id"]): {"leader": p.get("leader"), "relationship": p.get("relationship")}
+                          for p in rivals if p.get("met") and p.get("relationship")},
+        # None when the snapshot predates the claimed_victories section: outcome unknown, not "nobody won"
+        "claimed_victories": s.get("claimed_victories"),
     }
-    return {"game": {k: g.get(k) for k in ("turn", "seed", "age", "local_player_id", "difficulty")},
+    return {"v": DIGEST_VERSION, "game": {k: g.get(k) for k in ("turn", "seed", "age", "local_player_id", "difficulty")},
             "captured_at": s.get("captured_at"), "player_id": pid,
             "metrics": {str(k): v for k, v in m.items()}, "summary": summary}
+
+
+def outcome(claimed: list[dict] | None) -> tuple[str | None, list[dict]]:
+    """(status, won victories) from a snapshot's claimed_victories. A place-1 claim is a won victory, and every victory
+    type the game defines ends the game. None (snapshot predates the capture) gives status None: unknown."""
+    won = [{"victory": v.get("victory"), "players": v.get("players") or []} for v in claimed or [] if v.get("place") == 1]
+    return (None if claimed is None else "over" if won else "in_progress"), won
 
 
 def load_digests(seed: str) -> list[dict]:
@@ -105,9 +140,12 @@ def load_digests(seed: str) -> list[dict]:
     kept: list[dict] = []
     for p in sorted(src.glob("T*.json"), key=export._stamp):
         c = cache / p.name
+        d = None
         if c.exists() and c.stat().st_mtime >= p.stat().st_mtime:
             d = json.loads(c.read_text())
-        else:
+            if d.get("v") != DIGEST_VERSION:
+                d = None
+        if d is None:
             try:
                 d = digest(json.loads(p.read_text()))
             except ValueError:
@@ -133,16 +171,20 @@ def refresh(seed: str | None = None, db: Path | None = None, run_export: bool = 
     local = game["game"].get("local_player_id") or 0
 
     with store.tx(db) as con:
-        for t in ("ages", "players", "turns", "metrics", "events", "phases"):
+        for t in ("ages", "players", "turns", "metrics", "events", "phases", "combat_rewards"):
             con.execute(f"DELETE FROM {t} WHERE game=?", (seed,))
         last = digests[-1] if digests else None
         cur_age = last["game"]["age"] if last else game["ages"][-1]["age"]
         cur_turn = last["game"]["turn"] if last else clock.lengths[cur_age]
         gm = game["game"]
-        con.execute("INSERT OR REPLACE INTO games VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        status, won = outcome(((last or {}).get("summary") or {}).get("claimed_victories"))
+        con.execute("INSERT OR REPLACE INTO games (game, guid, leader, civilization, difficulty, map, map_size, speed, app_version, "
+                    "local_player_id, current_age, current_turn, current_g, age_turns_max, status, victories, updated_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
             seed, gm.get("guid"), gm.get("leader"), gm.get("civilization"), gm.get("difficulty"), gm.get("map"),
             gm.get("map_size"), gm.get("speed"), gm.get("app_version"), local, cur_age, cur_turn,
-            clock.offset[cur_age] + cur_turn, ((last or {}).get("summary", {}).get("age_progress") or {}).get("max"), store.now()))
+            clock.offset[cur_age] + cur_turn, ((last or {}).get("summary", {}).get("age_progress") or {}).get("max"),
+            status, json.dumps(won), store.now()))
         for i, a in enumerate(game["ages"]):
             con.execute("INSERT INTO ages VALUES (?,?,?,?,?)", (seed, a["age"], i, a["turns"], a["g_offset"]))
         for p in game["players"]:
@@ -194,7 +236,19 @@ def refresh(seed: str | None = None, db: Path | None = None, run_export: bool = 
         events = [e for e in events if not (e["kind"] == "government" and e["players"] == [local]
                                             and (e.get("start") or {}).get("age") in snap_ages)]
         events += _snapshot_spans(digests, clock, local)
+        events += _relationship_events(digests, clock, local)
+        spent = influence_spent(digests)
+        _attach_influence(events, spent, local)
+        _tag_capitals(events, game["players"])
         _cumulative(events, put, clock, cur_age, cur_turn)
+        _diplomacy_metrics(events, spent, put, clock, cur_age, cur_turn, local)
+        for d in digests:  # on-screen suzerainties (met city-states) win over the log-derived counts
+            for pid, ms in d["metrics"].items():
+                if "suzerainties" in ms:
+                    put(d["game"]["age"], d["game"]["turn"], int(pid), "suzerainties", ms["suzerainties"], "snapshot", "visible")
+        rewards = game.get("combat_rewards") or []
+        _combat_metrics(rewards, game.get("unexplained_gold") or [], put, clock, cur_age, cur_turn, local)
+        _insert_rewards(con, seed, rewards)
         con.executemany("INSERT OR REPLACE INTO metrics VALUES (?,?,?,?,?,?,?,?,?)", rows.values())
 
         from .rules import text_index
@@ -211,14 +265,23 @@ def refresh(seed: str | None = None, db: Path | None = None, run_export: bool = 
             s, en = e.get("start") or {}, e.get("end") or {}
             con.execute("INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                 seed, k, e["kind"], e["subject"], s.get("g"), s.get("age"), s.get("turn"), s.get("lo"), s.get("hi"),
-                en.get("g"), en.get("age"), en.get("turn"), json.dumps(e["players"]), int(local in e["players"]),
+                en.get("g"), en.get("age"), en.get("turn"), json.dumps(e["players"]), int(_is_local(e, local)),
                 int(bool(e.get("minor"))), e["precision"], e["source"], json.dumps(e.get("detail") or {}, default=export._json_default)))
 
         for p in phases.build(con, seed):
             con.execute("INSERT OR REPLACE INTO phases VALUES (?,?,?,?,?,?,?,?)", (
-                seed, p["scope"], p["scope_key"], p["g_start"], p["g_end"], p["title"], p["verdict"], json.dumps(p["facts"], default=str)))
+                seed, p["scope"], p["scope_key"], p["g_start"], p["g_end"], p["title"], p["outcome"], json.dumps(p["facts"], default=str)))
         store.set_meta(con, "last_refresh", {"game": seed, "at": store.now(), "g": clock.offset[cur_age] + cur_turn})
     return {"game": seed, "age": cur_age, "turn": cur_turn, "metrics": len(rows), "events": len(events), "turns": len(digests)}
+
+
+def _is_local(e: dict, local: int) -> bool:
+    """The local player is involved and would know: a rival's espionage against the player is hidden from the target
+    (it may never be discovered), so it stays out of the player's timeline and briefing."""
+    d = e.get("detail") or {}
+    if e["kind"] == "diplomacy_action" and d.get("group") == "espionage" and d.get("initiator") != local:
+        return False
+    return local in e["players"]
 
 
 def _display(subject: str, names: dict[str, str]) -> str:
@@ -227,6 +290,20 @@ def _display(subject: str, names: dict[str, str]) -> str:
     if not m:
         return subject
     return names.get(f"LOC_{m.group(1)}_NAME", subject)
+
+
+def _tag_capitals(events: list[dict], players: list[dict]) -> None:
+    """settlement_captured: capital=True when the settlement carries the losing civ's capital name (Civilizations
+    CapitalName). Foreign settlements have no capital flag on screen; a renamed or moved capital is missed."""
+    from .rules import capital_names
+
+    caps = capital_names()
+    civ = {(p["id"], a): c for p in players for a, c in (p.get("civilizations") or {}).items()}
+    for e in events:
+        if e["kind"] == "settlement_captured":
+            frm, age = e["detail"].get("from_player"), (e.get("start") or {}).get("age")
+            if caps.get(civ.get((frm, age))) == e["subject"]:
+                e["detail"]["capital"] = True
 
 
 def _snapshot_spans(digests: list[dict], clock: export.Clock, local: int) -> list[dict]:
@@ -285,6 +362,146 @@ def _cumulative(events: list[dict], put, clock: export.Clock, cur_age: str, cur_
             age = max((a for a, off in ages if off < g), key=lambda a: clock.offset[a])
             put(age, g - clock.offset[age], pid, metric, total, "derived")
         put(cur_age, cur_turn, pid, metric, total, "derived")
+
+
+def _combat_metrics(rewards: list[dict], unexplained: list[dict], put, clock: export.Clock, cur_age: str, cur_turn: int,
+                    local: int) -> None:
+    """Cumulative combat_* / kill_gold_total / count metrics at each turn they change and at the current turn, plus the
+    per-turn unexplained_gold and its running unexplained_gold_total (positive turns only). Unexplained gold is never
+    attributed to a combat kind. The local player gets every combat metric and unexplained_gold_total (0 from the first
+    turn) so goals can use them before the first reward."""
+    from . import combat
+
+    first = next(((a, 1) for a in export.AGES if clock.lengths.get(a)), None)
+    gains: dict[int, list[tuple[int, str, int, float]]] = defaultdict(list)
+    for r in unexplained:
+        put(r["age"], r["turn"], r["player"], "unexplained_gold", r["value"], "log:Player_Treasury")
+        if r["age"] in clock.offset and r["turn"] is not None:
+            gains[r["player"]].append((clock.offset[r["age"]] + int(r["turn"]), r["age"], int(r["turn"]), r["value"]))
+    for pid in set(gains) | ({local} if first else set()):
+        if pid == local and first:
+            put(*first, pid, "unexplained_gold_total", 0, "derived")
+        total = 0.0
+        for _, age, turn, v in sorted(gains.get(pid, [])):
+            if v > 0:
+                total += v
+                put(age, turn, pid, "unexplained_gold_total", round(total, 2), "derived")
+        put(cur_age, cur_turn, pid, "unexplained_gold_total", round(total, 2), "derived")
+    at = {e["g"]: (e["age"], e["turn"]) for e in rewards}
+    inc = combat.cumulative(rewards)
+    if first:
+        for metric in store.METRICS:
+            if store.METRICS[metric][3].startswith("derived from combat_rewards") and (local, metric) not in inc:
+                put(*first, local, metric, 0, "derived")
+                put(cur_age, cur_turn, local, metric, 0, "derived")
+    for (pid, metric), per_g in inc.items():
+        total = 0.0
+        if pid == local and first:
+            put(*first, pid, metric, 0, "derived")
+        for g in sorted(per_g):
+            total += per_g[g]
+            put(*at[g], pid, metric, round(total, 2), "derived")
+        put(cur_age, cur_turn, pid, metric, round(total, 2), "derived")
+
+
+def influence_spent(digests: list[dict]) -> list[tuple[str, int, float]]:
+    """[(age, turn, influence)]: the local player's influence bank at turn t plus that turn's influence income minus the
+    bank at turn t+1, for consecutive snapshots in one age. Positive: spent that turn (befriending, endeavors,
+    sanctions, responses, support); negative: gained beyond the per-turn yield. Not attributed to an action."""
+    out = []
+    for a, b in zip(digests, digests[1:]):
+        ga, gb = a["game"], b["game"]
+        if ga.get("age") != gb.get("age") or gb.get("turn") != (ga.get("turn") or 0) + 1:
+            continue
+        pid = str(a.get("player_id", 0))
+        ma, mb = a["metrics"].get(pid) or {}, b["metrics"].get(str(b.get("player_id", 0))) or {}
+        bal, inc, nxt = ma.get("influence_balance"), ma.get("influence_per_turn"), mb.get("influence_balance")
+        if None in (bal, inc, nxt):
+            continue
+        out.append((ga["age"], ga["turn"], round(bal + inc - nxt, 2)))
+    return out
+
+
+def _attach_influence(events: list[dict], spent: list[tuple[str, int, float]], local: int) -> None:
+    """The turn's influence spending on the local player's diplomacy actions started that turn (a turn total, shared by
+    every action started that turn: not split between them)."""
+    by_turn = {(a, t): v for a, t, v in spent}
+    for e in events:
+        s, d = e.get("start") or {}, e.get("detail") or {}
+        if e["kind"] in ("diplomacy_action", "befriend") and d.get("initiator") == local and e["precision"] == "exact":
+            v = by_turn.get((s.get("age"), s.get("turn")))
+            if v is not None:
+                d["turn_influence_spent"] = v
+
+
+def _relationship_events(digests: list[dict], clock: export.Clock, local: int) -> list[dict]:
+    """A met rival's attitude toward the local player changed level (Hostile .. Helpful) between consecutive snapshots."""
+    out, prev = [], {}
+    for d in digests:
+        a, t = d["game"]["age"], d["game"]["turn"]
+        rel = (d.get("summary") or {}).get("relationships") or {}
+        for pid, r in rel.items():
+            old = prev.get(pid)
+            if old and old["relationship"] != r["relationship"]:
+                out.append(export._ev("relationship", clock.at(a, t), clock.at(a, t), [local, int(pid)],
+                                      f"{r.get('leader') or 'player ' + pid}: {old['relationship']} -> {r['relationship']}",
+                                      "snapshot", previous=old["relationship"], relationship=r["relationship"]))
+            prev[pid] = r
+    return out
+
+
+def _diplomacy_metrics(events: list[dict], spent: list[tuple[str, int, float]], put, clock: export.Clock, cur_age: str,
+                       cur_turn: int, local: int) -> None:
+    """Diplomacy counts per player (diplomacy.metric_series) at each turn they change and at the current turn, the local
+    player's per-turn influence_spent and its running total of positive turns. The local player gets every count from
+    0 at the first turn so goals can use them before the first event."""
+    from . import diplomacy
+
+    first = next(((a, 1) for a in export.AGES if clock.lengths.get(a)), None)
+    ages = sorted(clock.offset.items(), key=lambda kv: kv[1])
+
+    def at_g(g: int) -> tuple[str, int]:
+        age = max((a for a, off in ages if off < g), key=lambda a: clock.offset[a])
+        return age, g - clock.offset[age]
+
+    series = diplomacy.metric_series(events, clock, cur_age, cur_turn)
+    if first:
+        for metric in DIPLOMACY_METRICS:
+            if (local, metric) not in series:
+                put(*first, local, metric, 0, "derived")
+                put(cur_age, cur_turn, local, metric, 0, "derived")
+    for (pid, metric), per_g in series.items():
+        if pid == local and first and metric != "independents_met":
+            put(*first, pid, metric, 0, "derived")
+        for g, v in sorted(per_g.items()):
+            put(*at_g(g), pid, metric, v, "derived")
+    total = 0.0
+    for age, turn, v in spent:
+        put(age, turn, local, "influence_spent", v, "snapshot", "visible")
+        if v > 0:
+            total += v
+            put(age, turn, local, "influence_spent_total", round(total, 2), "derived", "visible")
+    if spent:
+        put(cur_age, cur_turn, local, "influence_spent_total", round(total, 2), "derived", "visible")
+
+
+DIPLOMACY_METRICS = ("suzerainties", "suzerainties_total", "befriend_actions_active", "diplomatic_actions_started_total",
+                     "independents_met")
+
+
+def _insert_rewards(con, seed: str, rewards: list[dict]) -> None:
+    cols = ("kind", "turn", "age", "player_id", "x", "y", "unit", "target", "modifier", "yield")
+    seen: dict[str, int] = {}
+    for e in rewards:
+        k = store.hashed("|".join(str(e.get(c)) for c in cols))
+        seen[k] = seen.get(k, 0) + 1
+        if seen[k] > 1:
+            k = f"{k}-{seen[k]}"
+        detail = {c: e[c] for c in ("modifier", "granted_by", "victim_strength", "city_state_type", "base_amount")
+                  if e.get(c) is not None}
+        con.execute("INSERT INTO combat_rewards VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+            seed, k, e["g"], e["age"], e["turn"], e["player_id"], e["kind"], e.get("yield"), e.get("amount"), e["basis"],
+            e.get("x"), e.get("y"), e.get("unit"), e.get("target"), e.get("target_owner"), e["source"], json.dumps(detail)))
 
 
 def latest_seed() -> str | None:
